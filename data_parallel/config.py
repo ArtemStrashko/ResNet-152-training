@@ -3,7 +3,7 @@ do_data_parallel = True
 
 per_device_batch_size = 1
 learning_rate = 2e-5
-epochs = 5
+max_n_epochs = 100
 
 train_data_size = 1000
 test_data_size = 100

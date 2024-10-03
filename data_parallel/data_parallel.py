@@ -1,49 +1,57 @@
 # Import necessary libraries and modules
+import random
 import torch  # Import the PyTorch library
 from datetime import datetime  # Import the datetime module for time tracking
 import torch.nn as nn  # Import PyTorch's neural network module
-# from transformers import AutoTokenizer, BertForSequenceClassification, AdamW, get_linear_schedule_with_warmup  # Import specific modules from the Hugging Face Transformers library
-from datasets import load_dataset  # Import a function to load datasets
-from torch.utils.data import DataLoader, TensorDataset  # Import PyTorch data loading utilities
+from torch.utils.data import DataLoader, random_split  # Import PyTorch data loading utilities
 from torchvision import models
+from torchvision import datasets, transforms
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm  # Import tqdm for progress tracking
 import config as cfg  # Import a custom configuration module (assumed to exist)
 import os  # Import the os module for operating system-related functions
 
+# TODO: Write Distributed Data Parallel Code! Right now it is just Data Parallel.
+
 class DataParallelFineTune:
     def __init__(self, model: nn.Module, # =models.resnet152(pretrained=True),
-                 dataset,
                 #  optimizer=None,
                 #  criterion=None,
                 #  scheduler=None,
-                 n_data_classes: int = 10):
+                 learning_rate: float = 1e-4,
+                 n_data_classes: int = 10,
+                 do_data_parallel: bool = False):
         self.model = model
-        self.dataset = dataset
         n_input_features = self.model.fc.in_features
         self.model.fc = torch.nn.Linear(n_input_features, n_data_classes)
 
+        if do_data_parallel and torch.cuda.device_count() > 1:
+            self.model = torch.nn.DataParallel(self.model)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(device)
+
         self.criterion = torch.nn.CrossEntropyLoss()
-        self.optimizer = optim.Adam(self.model.fc.parameters(), lr=1e-4)
+        self.optimizer = optim.Adam(self.model.fc.parameters(), lr=learning_rate)
         self.scheduler = StepLR(optimizer=self.optimizer, step_size=10, gamma=0.1)
 
-
-    def train(self, train_loader, epoch:int, rank:int, do_data_parallel=False):
+    def train_epoch(self, train_loader: DataLoader, epoch:int):
         self.model.train()
         train_loss = 0.0
         for batch in tqdm(train_loader, leave=False):
             images, real_labels = batch
-            images, real_labels = images.to(rank), real_labels.to(rank)
+            # images, real_labels = images.to(rank), real_labels.to(rank)
 
             self.optimizer.zero_grad()
-            predicted_labels = self.model(images)
 
-            # A Mean of loss is required to be computed as calculated by each device
-            loss = self.criterion(predicted_labels, real_labels)
-            if do_data_parallel and torch.cuda.device_count() > 1:
-                # Check if data parallelism is enabled and multiple GPUs are available
-                loss = loss.mean()  # Compute the mean loss across GPUs
+            raw_logits = self.model(images)
+
+            # Mean of loss is required to be computed as calculated by each device
+            loss = self.criterion(raw_logits, real_labels)
+            # if do_data_parallel and torch.cuda.device_count() > 1:
+            #     # Check if data parallelism is enabled and multiple GPUs are available
+            #     loss = loss.mean()  # Compute the mean loss across GPUs
 
             loss.backward()
             self.optimizer.step()
@@ -55,111 +63,127 @@ class DataParallelFineTune:
         print(f'Epoch {epoch + 1} - Average Training Loss: {avg_train_loss:.4f}')
         return avg_train_loss
 
-    def test(self, test_loader, rank:int):
-        ...
+    def eval(self, eval_data_loader: DataLoader, rank:int):
+        self.model.eval()
+        total_correct = 0
+        total_samples = 0
+
+        with torch.no_grad():
+            for batch in tqdm(eval_data_loader, leave=False):
+                images, real_labels = batch
+                images, real_labels = images.to(rank), real_labels.to(rank)
+                raw_logits = self.model(images)
+                predicted_labels = torch.argmax(raw_logits, dim=1)
+                correct_predictions = (predicted_labels == real_labels).sum().item()
+                total_correct += correct_predictions
+                total_samples += real_labels.size(0)
+
+        accuracy = total_correct / total_samples
+        print(f'Test Accuracy: {accuracy * 100:.2f}%')
+
+        return accuracy
+
+class Imagenette:
+    def get_data_loaders(self,
+                 batch_size:int = 32,
+                 num_workers:int = 4):
+        train_transforms = transforms.Compose([
+            transforms.RandomResizedCrop(224),  # Randomly crop and resize to 224x224
+            transforms.RandomHorizontalFlip(),  # Apply random horizontal flipping
+            transforms.ToTensor(),              # Convert the image to a tensor
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Normalize with ImageNet stats
+                                std=[0.229, 0.224, 0.225]),
+            ])
+
+        val_transforms = transforms.Compose([
+            transforms.Resize(256),             # Resize to 256 pixels on the shorter side
+            transforms.CenterCrop(224),         # Center crop to 224x224
+            transforms.ToTensor(),              # Convert the image to a tensor
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Normalize with ImageNet stats
+                                std=[0.229, 0.224, 0.225]),
+            ])
+
+        train_dir = "~/imagenette2/train"
+        val_dir = "~/imagenette2/val"
+
+        train_dataset = datasets.ImageFolder(train_dir, transform=train_transforms)
+        val_test_dataset = datasets.ImageFolder(val_dir, transform=val_transforms)
+
+        val_size = int(2 * len(val_test_dataset) / 3)
+        test_size = len(val_test_dataset) - val_size
+
+        val_dataset, test_dataset = random_split(val_test_dataset, [val_size, test_size])
+
+        train_loader = DataLoader(train_dataset,
+                                  batch_size=batch_size,
+                                  shuffle=True,
+                                  num_workers=num_workers)
+        val_loader = DataLoader(val_dataset,
+                                batch_size=batch_size,
+                                shuffle=False,
+                                num_workers=num_workers)
+        test_loader = DataLoader(test_dataset,
+                                batch_size=batch_size,
+                                shuffle=False,
+                                num_workers=num_workers)
+
+        return train_loader, val_loader, test_loader
 
 
-def test(model, test_loader, rank):
-    model.eval()  # Set the model in evaluation mode
-    total_accuracy = 0.0  # Initialize a variable to store the total accuracy
+def set_random_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-    all_true_labels_in_epoch = []  # Initialize a list to store true labels for the epoch
-    all_predictions_in_epoch = []  # Initialize a list to store predicted labels for the epoch
-
-    with torch.no_grad():  # Disable gradient calculation for testing
-        for batch in tqdm(test_loader, leave=False):  # Iterate over test data batches and display a progress bar
-            input_ids, attention_mask, labels = batch  # Unpack batch into input IDs, attention masks, and labels
-            input_ids, attention_mask, labels = input_ids.to(rank), attention_mask.to(rank), labels.to(rank)  # Move data to the specified device
-
-            outputs = model(input_ids, attention_mask=attention_mask)  # Perform a forward pass without labels
-            logits = outputs.logits  # Get the model's output logits
-
-            predicted_labels = torch.argmax(logits, dim=1)  # Get the predicted labels
-            correct_predictions = torch.sum(predicted_labels == labels).item()  # Count correct predictions
-            total_accuracy += correct_predictions  # Accumulate correct predictions
-
-            all_predictions_in_epoch.extend(predicted_labels.tolist())  # Append predicted labels to the list
-            all_true_labels_in_epoch.extend(labels.tolist())  # Append true labels to the list
-
-        accuracy = total_accuracy / len(test_loader.dataset)  # Calculate the accuracy on the test set
-        print(f'Accuracy on Test Set: {accuracy:.4f}')  # Print the accuracy
-        return all_true_labels_in_epoch, all_predictions_in_epoch, accuracy  # Return true labels, predicted labels, and accuracy
 
 # Main function for data parallel training
-def data_parallel_main(args):
+def data_parallel_main(args: dict):
 
-    do_data_parallel = args['do_data_parallel']  # Get a flag indicating whether to use data parallelism
+    set_random_seed(1234)
 
-    batch_size = args['batch_size']  # Get the batch size from the arguments
-    learning_rate = args['learning_rate']  # Get the learning rate from the arguments
-    epochs = args['epochs']  # Get the number of training epochs from the arguments
+    # Load the model.
+    do_data_parallel = args['do_data_parallel']
+    model = models.resnet152(pretrained=True)
+    if do_data_parallel and torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model, device_ids=cfg.visible_devices)
 
-    train_data_size = args['train_data_size']  # Get the size of the training data from the arguments
-    test_data_size = args['test_data_size']  # Get the size of the test data from the arguments
-    max_length = args['max_length']  # Get the maximum sequence length from the arguments
+    # Load the data loaders.
+    batch_size = args['batch_size']
+    dataset = Imagenette()
+    (train_loader,
+     val_loader,
+     test_loader) = dataset.get_data_loaders(batch_size = batch_size)
 
-    # Load the IMDb dataset and shuffle it
-    dataset = load_dataset('imdb')
-    dataset = dataset.shuffle(seed=32)
+    learning_rate = args['learning_rate']
+    trainer = DataParallelFineTune(model = model, learning_rate = learning_rate)
 
-    # Get a subset of the dataset for training and testing
-    train_texts, train_labels, test_texts, test_labels = (
-        dataset['train']['text'][0:train_data_size], dataset['train']['label'][0:train_data_size],
-        dataset['test']['text'][0:test_data_size], dataset['test']['label'][0:test_data_size]
-    )
+    max_n_epochs = args["max_n_epochs"]
 
-    # Initialize BERT tokenizer
-    model_name = args["model_name"]
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Not necessary, try without reducing data size.
+    # train_data_size = args['train_data_size']  # Get the size of the training data from the arguments
+    # test_data_size = args['test_data_size']  # Get the size of the test data from the arguments
 
-    # Tokenize and encode the text data
-    print("Tokenizing Train Dataset")
-    train_encodings = tokenizer(train_texts, truncation=True, padding=True, max_length=max_length, return_tensors='pt')  # Tokenize training data
-    print("Tokenizing Test Dataset")
-    test_encodings = tokenizer(test_texts, truncation=True, padding=True, max_length=max_length, return_tensors='pt')  # Tokenize test data
+    # # Training loop
+    # rank = torch.device(args['device'])  # Get the device for training
+    # torch.cuda.set_per_process_memory_fraction(cfg.memory_limit)  # Set GPU memory allocation limit
+    # model.to(rank)  # Move the model to the specified device
+    # print("Training on " + str(rank))  # Print the device being used for training
+    # start_time = datetime.now()  # Record the start time for training
 
-    # Create PyTorch datasets
-    print("Train and Test Assignment")
-    train_dataset = TensorDataset(train_encodings['input_ids'], train_encodings['attention_mask'],
-                                    torch.tensor(train_labels))  # Create a training dataset
-    test_dataset = TensorDataset(test_encodings['input_ids'], test_encodings['attention_mask'],
-                                    torch.tensor(test_labels))  # Create a test dataset
+    # for epoch in tqdm(range(epochs)):  # Iterate through training epochs
+    #     train_loss = train(model, train_loader, optimizer, epoch, rank, do_data_parallel)  # Perform training and get the average loss
+    #     labels, predicted_labels, test_accuracy = test(model, test_loader, rank)  # Perform testing and get accuracy
 
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)  # Create a data loader for training data
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)  # Create a data loader for test data
+    #     scheduler.step()  # Update the learning rate scheduler
 
-    # Define the BERT-based text classifier model
-    print("Loading Model")
-    model = BertForSequenceClassification.from_pretrained(model_name, num_labels=2)  # Binary classification
+    # end_time = datetime.now()  # Record the end time for training
 
-    # Enable or disable data parallel if multiple GPUs are available
-    if do_data_parallel and torch.cuda.device_count() > 1:  # Check if data parallelism is enabled
-        model = nn.DataParallel(model, device_ids=cfg.visible_devices)  # Enable data parallelism across multiple GPUs
+    # print('Time taken per epoch (seconds): ' + str(((end_time - start_time).seconds) / epochs))  # Calculate and print the time taken per epoch
 
-    # Define optimizer and learning rate scheduler
-    optimizer = AdamW(model.parameters(), lr=learning_rate)  # Define the optimizer
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0,
-                                                num_training_steps=len(train_loader) * epochs)  # Define the learning rate scheduler
-
-    # Training loop
-    rank = torch.device(args['device'])  # Get the device for training
-    torch.cuda.set_per_process_memory_fraction(cfg.memory_limit)  # Set GPU memory allocation limit
-    model.to(rank)  # Move the model to the specified device
-    print("Training on " + str(rank))  # Print the device being used for training
-    start_time = datetime.now()  # Record the start time for training
-
-    for epoch in tqdm(range(epochs)):  # Iterate through training epochs
-        train_loss = train(model, train_loader, optimizer, epoch, rank, do_data_parallel)  # Perform training and get the average loss
-        labels, predicted_labels, test_accuracy = test(model, test_loader, rank)  # Perform testing and get accuracy
-
-        scheduler.step()  # Update the learning rate scheduler
-
-    end_time = datetime.now()  # Record the end time for training
-
-    print('Time taken per epoch (seconds): ' + str(((end_time - start_time).seconds) / epochs))  # Calculate and print the time taken per epoch
-
-    return {'loss': train_loss}  # Return the final training loss
+    # return {'loss': train_loss}  # Return the final training loss
 
 if __name__ == '__main__':
     total_devices = len(cfg.visible_devices) if cfg.do_data_parallel else 1  # Determine the total number of devices used for training
