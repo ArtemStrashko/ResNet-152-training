@@ -121,7 +121,9 @@ class DataParallelFineTune:
             train_loss = self.train_epoch(train_loader, epoch, rank, do_data_parallel)
             train_accuracy = self.eval(train_loader, rank)
             val_accuracy = self.eval(val_loader, rank)
-            print(f"Epoch {epoch}: train_loss = {train_loss},\train_accuracy = {train_accuracy},\val_accuracy = {val_accuracy}")
+            print(f"Epoch {epoch}: train_loss = {train_loss},\
+                  train_accuracy = {train_accuracy},\
+                    val_accuracy = {val_accuracy}")
 
             if val_accuracy > best_val_acc * 1.01:
                 best_val_acc = val_accuracy
