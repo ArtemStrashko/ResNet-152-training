@@ -1,4 +1,3 @@
-# Define hyperparameters
 do_data_parallel = True
 
 per_device_batch_size = 1
@@ -7,8 +6,6 @@ max_n_epochs = 100
 
 train_data_size = 1000
 test_data_size = 100
-max_length = 512
-model_name = 'resnet152'
 
 device = 'cuda'
 
@@ -16,4 +13,4 @@ device = 'cuda'
 memory_limit = 1.0
 
 # Only use the specified devices
-visible_devices = [0,1,2,3]
+visible_devices = [0]#,1,2,3]
