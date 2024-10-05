@@ -5,7 +5,8 @@ learning_rate = 2e-5
 max_n_epochs = 100
 
 train_data_size = 1000
-test_data_size = 100
+valid_data_size = 200
+test_data_size = 200
 
 device = 'cuda'
 

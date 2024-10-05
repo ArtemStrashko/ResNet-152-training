@@ -1,3 +1,4 @@
+import os
 import random
 
 # import os
@@ -9,7 +10,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 from torchvision import datasets, models, transforms
 from tqdm import tqdm  # Import tqdm for progress tracking
 
@@ -66,7 +67,7 @@ class DataParallelFineTune:
         self.scheduler.step()
 
         avg_train_loss = train_loss / len(train_loader)
-        print(f"Epoch {epoch + 1} - Average Training Loss: {avg_train_loss:.4f}")
+        # print(f"Epoch {epoch + 1} - Average Training Loss: {avg_train_loss:.4f}")
         return avg_train_loss
 
     def eval(self, eval_data_loader: DataLoader, rank: torch.device):
@@ -96,7 +97,7 @@ class DataParallelFineTune:
         total_correct = total_correct_tensor.item()
         total_samples = total_samples_tensor.item()
         accuracy = total_correct / total_samples
-        print(f"Eval Accuracy: {accuracy * 100:.2f}%")
+        # print(f"Eval Accuracy: {accuracy * 100:.2f}%")
 
         return accuracy
 
@@ -120,6 +121,7 @@ class DataParallelFineTune:
             train_loss = self.train_epoch(train_loader, epoch, rank, do_data_parallel)
             train_accuracy = self.eval(train_loader, rank)
             val_accuracy = self.eval(val_loader, rank)
+            print(f"Epoch {epoch}: train_loss = {train_loss},\train_accuracy = {train_accuracy},\val_accuracy = {val_accuracy}")
 
             if val_accuracy > best_val_acc * 1.01:
                 best_val_acc = val_accuracy
@@ -134,7 +136,13 @@ class DataParallelFineTune:
 
 
 class Imagenette:
-    def get_data_loaders(self, batch_size: int = 32, num_workers: int = 4):
+    def get_data_loaders(self,
+                         batch_size: int = 32,
+                         num_workers: int = 4,
+                         train_data_size:int | None = None,
+                         valid_data_size:int | None = None,
+                         test_data_size:int | None = None):
+
         train_transforms = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
@@ -174,6 +182,11 @@ class Imagenette:
             val_test_dataset, [val_size, test_size]
         )
 
+        # Subsample the data if needed.
+        train_dataset = self._subsample(train_dataset, train_data_size)
+        val_dataset = self._subsample(val_dataset, valid_data_size)
+        test_dataset = self._subsample(test_dataset, test_data_size)
+
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
         )
@@ -185,6 +198,12 @@ class Imagenette:
         )
 
         return train_loader, val_loader, test_loader
+
+    def _subsample(self, dataset: Subset, n_samples: int | None = None):
+        if n_samples is not None:
+            random_indices = random.sample(range(len(dataset)), n_samples)
+            return Subset(dataset, random_indices)
+        return dataset
 
 
 def set_random_seed(seed: int):
@@ -203,6 +222,9 @@ def data_parallel_main(args: dict):
     batch_size = args["batch_size"]
     max_n_epochs = args["max_n_epochs"]
     learning_rate = args["learning_rate"]
+    train_data_size = args['train_data_size']  # Get the size of the training data from the arguments
+    test_data_size = args['test_data_size']  # Get the size of the test data from the arguments
+    valid_data_size = args['valid_data_size']  # Get the size of the validation data from the arguments
 
 
     # Load the model.
@@ -213,15 +235,11 @@ def data_parallel_main(args: dict):
     # Load the data loaders.
     dataset = Imagenette()
     (train_loader, val_loader, test_loader) = dataset.get_data_loaders(
-        batch_size=batch_size
+        batch_size=batch_size, train_data_size=train_data_size, valid_data_size=valid_data_size, test_data_size=test_data_size
     )
 
     # Initialize the trainer.
     trainer = DataParallelFineTune(model=model, learning_rate=learning_rate)
-
-    # Not necessary, try without reducing data size.
-    # train_data_size = args['train_data_size']  # Get the size of the training data from the arguments
-    # test_data_size = args['test_data_size']  # Get the size of the test data from the arguments
 
     # Training loop
     rank = torch.device(args["device"])  # Get the device for training
@@ -253,6 +271,14 @@ def data_parallel_main(args: dict):
 
 
 if __name__ == "__main__":
+
+    os.environ['RANK'] = '0'  # Set this to 0 for the master process (or a unique rank for each process)
+    os.environ['WORLD_SIZE'] = '1'  # Set this to the total number of processes (or GPUs)
+    os.environ['MASTER_ADDR'] = 'localhost'  # The IP address of the master node (can be localhost for a single machine)
+    os.environ['MASTER_PORT'] = '12355'  # Any open port number
+
+    dist.init_process_group(backend='nccl')
+
     total_devices = (
         len(cfg.visible_devices) if cfg.do_data_parallel else 1
     )  # Determine the total number of devices used for training
@@ -279,6 +305,7 @@ if __name__ == "__main__":
         "max_n_epochs": cfg.max_n_epochs,
         "train_data_size": cfg.train_data_size,
         "test_data_size": cfg.test_data_size,
+        "valid_data_size": cfg.valid_data_size,
         "device": cfg.device,
     }  # Create a dictionary of training arguments
     data_parallel_main(args)  # Start the training process
@@ -288,3 +315,5 @@ if __name__ == "__main__":
     print(
         f"Max Memory Consumed Per Device = {max_memory_consumed} GB"
     )  # Print the maximum memory consumed per device
+
+    dist.destroy_process_group()
