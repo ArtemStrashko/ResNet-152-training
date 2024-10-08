@@ -1,20 +1,18 @@
 import os
 import random
-
-# import os
+import time
 from datetime import datetime
 
 import config as cfg  # Import a custom configuration module (assumed to exist)
+import mlflow
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Subset, random_split
 from torchvision import datasets, models, transforms
-from tqdm import tqdm  # Import tqdm for progress tracking
-
-# TODOL subsample data set to speed up training.
+from tqdm import tqdm
 
 
 class DataParallelFineTune:
@@ -37,12 +35,11 @@ class DataParallelFineTune:
 
         self.criterion = torch.nn.CrossEntropyLoss()
         self.optimizer = optim.Adam(self.model.fc.parameters(), lr=learning_rate)
-        self.scheduler = StepLR(optimizer=self.optimizer, step_size=10, gamma=0.1)
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=100)
 
     def train_epoch(
         self,
         train_loader: DataLoader,
-        epoch: int,
         rank: torch.device,
         do_data_parallel: bool,
     ):
@@ -67,7 +64,6 @@ class DataParallelFineTune:
         self.scheduler.step()
 
         avg_train_loss = train_loss / len(train_loader)
-        # print(f"Epoch {epoch + 1} - Average Training Loss: {avg_train_loss:.4f}")
         return avg_train_loss
 
     def eval(self, eval_data_loader: DataLoader, rank: torch.device):
@@ -86,8 +82,12 @@ class DataParallelFineTune:
                 total_samples += real_labels.size(0)
 
         # Reduce across all GPUs
-        total_correct_tensor = torch.tensor([total_correct], dtype=torch.float32, device=rank)
-        total_samples_tensor = torch.tensor([total_samples], dtype=torch.float32, device=rank)
+        total_correct_tensor = torch.tensor(
+            [total_correct], dtype=torch.float32, device=rank
+        )
+        total_samples_tensor = torch.tensor(
+            [total_samples], dtype=torch.float32, device=rank
+        )
 
         # Sum the total_correct and total_samples across all GPUs
         dist.all_reduce(total_correct_tensor, op=dist.ReduceOp.SUM)
@@ -97,7 +97,6 @@ class DataParallelFineTune:
         total_correct = total_correct_tensor.item()
         total_samples = total_samples_tensor.item()
         accuracy = total_correct / total_samples
-        # print(f"Eval Accuracy: {accuracy * 100:.2f}%")
 
         return accuracy
 
@@ -114,16 +113,25 @@ class DataParallelFineTune:
 
         best_val_acc = 0.0
         epochs_to_improve = 0
-        epochs = 0
+        n_epochs = 0
 
         for epoch in range(max_n_epochs):
-            epochs += 1
-            train_loss = self.train_epoch(train_loader, epoch, rank, do_data_parallel)
+            n_epochs += 1
+            start_time = time.time()
+            _ = self.train_epoch(train_loader, rank, do_data_parallel)
             train_accuracy = self.eval(train_loader, rank)
             val_accuracy = self.eval(val_loader, rank)
-            print(f"Epoch {epoch}: train_loss = {train_loss},\
-                  train_accuracy = {train_accuracy},\
-                    val_accuracy = {val_accuracy}")
+            end_time = time.time()
+            time_taken = end_time - start_time
+            print(
+                f"Epoch {epoch + 1}: train_acc = {train_accuracy * 100:.2f}%, val_acc = {val_accuracy * 100:.2f}%, time = {time_taken:.1f} sec."
+            )
+            self._log_metrics(
+                epoch=epoch,
+                train_accuracy=train_accuracy,
+                val_accuracy=val_accuracy,
+                time_taken=time_taken,
+            )
 
             if val_accuracy > best_val_acc * 1.01:
                 best_val_acc = val_accuracy
@@ -134,16 +142,25 @@ class DataParallelFineTune:
             if epochs_to_improve >= patience and early_stopping:
                 print(f"Early stopping at epoch {epoch + 1}")
                 break
-        return train_accuracy, val_accuracy, epochs
+        return train_accuracy, val_accuracy, n_epochs
+
+    def _log_metrics(
+        self, epoch: int, train_accuracy: float, val_accuracy: float, time_taken: float
+    ):
+        mlflow.log_metric("train_accuracy", train_accuracy, step=epoch)
+        mlflow.log_metric("val_accuracy", val_accuracy, step=epoch)
+        mlflow.log_metric("time_taken", time_taken, step=epoch)
 
 
 class Imagenette:
-    def get_data_loaders(self,
-                         batch_size: int = 32,
-                         num_workers: int = 4,
-                         train_data_size:int | None = None,
-                         valid_data_size:int | None = None,
-                         test_data_size:int | None = None):
+    def get_data_loaders(
+        self,
+        batch_size: int = 32,
+        num_workers: int = 4,
+        train_data_size: int | None = None,
+        valid_data_size: int | None = None,
+        test_data_size: int | None = None,
+    ):
 
         train_transforms = transforms.Compose(
             [
@@ -224,20 +241,33 @@ def data_parallel_main(args: dict):
     batch_size = args["batch_size"]
     max_n_epochs = args["max_n_epochs"]
     learning_rate = args["learning_rate"]
-    train_data_size = args['train_data_size']  # Get the size of the training data from the arguments
-    test_data_size = args['test_data_size']  # Get the size of the test data from the arguments
-    valid_data_size = args['valid_data_size']  # Get the size of the validation data from the arguments
+    train_data_size = args["train_data_size"]
+    test_data_size = args["test_data_size"]
+    valid_data_size = args["valid_data_size"]
 
+    # Log parameters to mlflow.
+    mlflow.log_param("learning_rate", learning_rate)
+    mlflow.log_param("batch_size", batch_size)
+    mlflow.log_param("max_n_epochs", max_n_epochs)
+    mlflow.log_param("train_data_size", train_data_size)
+    mlflow.log_param("test_data_size", test_data_size)
+    mlflow.log_param("valid_data_size", valid_data_size)
 
     # Load the model.
     model = models.resnet152(weights=models.ResNet152_Weights.DEFAULT)
     if do_data_parallel and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model, device_ids=cfg.visible_devices)
 
+    mlflow.log_param("do_data_parallel", do_data_parallel)
+    mlflow.log_param("n_GPUs", torch.cuda.device_count())
+
     # Load the data loaders.
     dataset = Imagenette()
     (train_loader, val_loader, test_loader) = dataset.get_data_loaders(
-        batch_size=batch_size, train_data_size=train_data_size, valid_data_size=valid_data_size, test_data_size=test_data_size
+        batch_size=batch_size,
+        train_data_size=train_data_size,
+        valid_data_size=valid_data_size,
+        test_data_size=test_data_size,
     )
 
     # Initialize the trainer.
@@ -247,7 +277,7 @@ def data_parallel_main(args: dict):
     rank = torch.device(args["device"])  # Get the device for training
     torch.cuda.set_per_process_memory_fraction(
         cfg.memory_limit
-    )  # Set GPU memory allocation limit
+    )
     model.to(rank)  # Move the model to the specified device
     print("Training on " + str(rank))  # Print the device being used for training
     start_time = datetime.now()  # Record the start time for training
@@ -264,41 +294,34 @@ def data_parallel_main(args: dict):
 
     test_acc = trainer.eval(test_loader, rank)
 
-    print(
-        "Time taken per epoch (seconds): "
-        + str(((end_time - start_time).seconds) / epochs)
-    )
-
-    return {"train_acc": train_acc, "val_acc": val_acc, "test_acc": test_acc}
+    mlflow.log_metric("final_train_acc", train_acc)
+    mlflow.log_metric("final_val_acc", val_acc)
+    mlflow.log_metric("final_test_acc", test_acc)
+    mlflow.log_metric("time_per_epoch", ((end_time - start_time).seconds) / epochs)
 
 
 if __name__ == "__main__":
 
-    os.environ['RANK'] = '0'  # Set this to 0 for the master process (or a unique rank for each process)
-    os.environ['WORLD_SIZE'] = '1'  # Set this to the total number of processes (or GPUs)
-    os.environ['MASTER_ADDR'] = 'localhost'  # The IP address of the master node (can be localhost for a single machine)
-    os.environ['MASTER_PORT'] = '12355'  # Any open port number
+    total_devices = len(cfg.visible_devices) if cfg.do_data_parallel else 1
+    print(f"Training on {total_devices} devices")
 
-    dist.init_process_group(backend='nccl')
+    os.environ["RANK"] = (
+        "0"  # Set this to 0 for the master process (or a unique rank for each process)
+    )
+    os.environ["WORLD_SIZE"] = str(
+        total_devices
+    )  # Set this to the total number of processes (or GPUs)
+    os.environ["MASTER_ADDR"] = (
+        "localhost"  # The IP address of the master node (can be localhost for a single machine)
+    )
+    os.environ["MASTER_PORT"] = "12355"  # Any open port number
 
-    total_devices = (
-        len(cfg.visible_devices) if cfg.do_data_parallel else 1
-    )  # Determine the total number of devices used for training
+    dist.init_process_group(backend="nccl")
 
-    print(
-        f"Training on {total_devices} devices"
-    )  # Print the number of devices being used for training
+    batch_size = cfg.per_device_batch_size * total_devices
 
-    batch_size = (
-        cfg.per_device_batch_size * total_devices
-    )  # Calculate the total effective batch size
-
-    print(
-        "Per Device Batch Size = ", cfg.per_device_batch_size
-    )  # Print the batch size per device
-    print(
-        "Total Effective Batch Size = ", batch_size
-    )  # Print the total effective batch size
+    print("Per Device Batch Size = ", cfg.per_device_batch_size)
+    print("Total Effective Batch Size = ", batch_size)
 
     args = {
         "do_data_parallel": cfg.do_data_parallel,
@@ -309,13 +332,15 @@ if __name__ == "__main__":
         "test_data_size": cfg.test_data_size,
         "valid_data_size": cfg.valid_data_size,
         "device": cfg.device,
-    }  # Create a dictionary of training arguments
-    data_parallel_main(args)  # Start the training process
-    max_memory_consumed = round(
-        torch.cuda.max_memory_allocated() / 1e9, 2
-    )  # Get and round the maximum GPU memory consumption
-    print(
-        f"Max Memory Consumed Per Device = {max_memory_consumed} GB"
-    )  # Print the maximum memory consumed per device
+    }
+
+    mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
+    mlflow.set_experiment("resnet152_data_parallel_single_node")
+    with mlflow.start_run(run_name="resnet152"):
+        mlflow.log_params(args)
+
+        data_parallel_main(args)
+        max_memory_consumed = round(torch.cuda.max_memory_allocated() / 1e9, 2)
+        mlflow.log_metric("max_memory_per_device_GB", max_memory_consumed)
 
     dist.destroy_process_group()

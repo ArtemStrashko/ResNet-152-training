@@ -8,4 +8,4 @@ epochs = 2
 train_data_size = 1000
 test_data_size = 100
 max_length = 512
-model_name = 'prajjwal1/bert-mini'
+model_name = "prajjwal1/bert-mini"

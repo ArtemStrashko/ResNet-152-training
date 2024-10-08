@@ -1,1 +1,3 @@
 mlflow/.DS_Store
+*.pyc
+*/__pycache__/

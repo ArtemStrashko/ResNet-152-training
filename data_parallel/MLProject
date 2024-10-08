@@ -1,0 +1,7 @@
+name: ResNet-152 Training
+
+python_env: requirements.yaml
+
+entry_points:
+  train:
+    command: "python /home/ubuntu/ResNet-152-training/data_parallel"

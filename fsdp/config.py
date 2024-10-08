@@ -8,6 +8,6 @@ epochs = 1
 train_data_size = 200
 test_data_size = 20
 max_length = 512
-model_name = 'bert-large-uncased'
+model_name = "bert-large-uncased"
 
 memory_limit = 1.0
