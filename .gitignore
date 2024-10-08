@@ -1,4 +1,4 @@
 mlflow/.DS_Store
 *.pyc
 */__pycache__/
-*/mlruns/
+*mlruns/
