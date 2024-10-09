@@ -24,17 +24,19 @@ class DataParallelFineTune:
         #  scheduler=None,
         learning_rate: float = 1e-4,
         n_data_classes: int = 10,
-        do_data_parallel: bool = False,
     ):
+        if isinstance(model, nn.DataParallel):
+            n_input_features = model.module.fc.in_features
+            model.module.fc = torch.nn.Linear(n_input_features, n_data_classes)
+            optimizer = optim.Adam(model.module.fc.parameters(), lr=learning_rate)
+        else:
+            n_input_features = model.fc.in_features
+            model.fc = torch.nn.Linear(n_input_features, n_data_classes)
+            optimizer = optim.Adam(model.fc.parameters(), lr=learning_rate)
+
         self.model = model
-        n_input_features = self.model.fc.in_features
-        self.model.fc = torch.nn.Linear(n_input_features, n_data_classes)
-
-        if do_data_parallel and torch.cuda.device_count() > 1:
-            self.model = torch.nn.DataParallel(self.model)
-
         self.criterion = torch.nn.CrossEntropyLoss()
-        self.optimizer = optim.Adam(self.model.fc.parameters(), lr=learning_rate)
+        self.optimizer = optimizer
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=100)
 
     def train_epoch(
@@ -188,8 +190,14 @@ class Imagenette:
             ]
         )
 
-        train_dir = "~/imagenette2/train"
-        val_dir = "~/imagenette2/val"
+        train_dir = os.path.expanduser("~/imagenette2/train")
+        val_dir = os.path.expanduser("~/imagenette2/val")
+        # check if these directories exist
+        if not os.path.exists(train_dir) or not os.path.exists(val_dir):
+            print("The data may not be downloaded. Download as follows:")
+            print("wget https://s3.amazonaws.com/fast-ai-imageclas/imagenette2.tgz")
+            print("tar -xvzf imagenette2.tgz")
+            raise FileNotFoundError(f"{train_dir} or {val_dir} does not exist")
 
         train_dataset = datasets.ImageFolder(train_dir, transform=train_transforms)
         val_test_dataset = datasets.ImageFolder(val_dir, transform=val_transforms)
@@ -275,9 +283,7 @@ def data_parallel_main(args: dict):
 
     # Training loop
     rank = torch.device(args["device"])  # Get the device for training
-    torch.cuda.set_per_process_memory_fraction(
-        cfg.memory_limit
-    )
+    torch.cuda.set_per_process_memory_fraction(cfg.memory_limit)
     model.to(rank)  # Move the model to the specified device
     print("Training on " + str(rank))  # Print the device being used for training
     start_time = datetime.now()  # Record the start time for training
@@ -308,9 +314,7 @@ if __name__ == "__main__":
     os.environ["RANK"] = (
         "0"  # Set this to 0 for the master process (or a unique rank for each process)
     )
-    os.environ["WORLD_SIZE"] = str(
-        total_devices
-    )  # Set this to the total number of processes (or GPUs)
+    os.environ["WORLD_SIZE"] = "1"  # Set this to the total number of nodes.
     os.environ["MASTER_ADDR"] = (
         "localhost"  # The IP address of the master node (can be localhost for a single machine)
     )
@@ -322,6 +326,8 @@ if __name__ == "__main__":
 
     print("Per Device Batch Size = ", cfg.per_device_batch_size)
     print("Total Effective Batch Size = ", batch_size)
+
+    print("Training on", total_devices, "GPUs")
 
     args = {
         "do_data_parallel": cfg.do_data_parallel,
@@ -335,8 +341,8 @@ if __name__ == "__main__":
     }
 
     mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
-    mlflow.set_experiment("resnet152_data_parallel_single_node")
-    with mlflow.start_run(run_name="resnet152"):
+    mlflow.set_experiment(cfg.MLFLOW_EXPERIMENT_ID)
+    with mlflow.start_run(run_name=cfg.MLFLOW_RUN_NAME):
         mlflow.log_params(args)
 
         data_parallel_main(args)

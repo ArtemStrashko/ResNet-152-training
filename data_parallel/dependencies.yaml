@@ -7,3 +7,4 @@ dependencies:
   - tqdm>=4.66.1
   - ray[tune]==2.7.0
   - torchvision>=0.15.2
+  - virtualenv

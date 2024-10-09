@@ -14,7 +14,8 @@ device = "cuda"
 memory_limit = 1.0
 
 # Only use the specified devices
-visible_devices = [0]  # ,1,2,3]
+visible_devices = [0,1,2,3]
 
 MLFLOW_TRACKING_URI = "http://localhost:5000"
-MLFLOW_EXPERIMENT_ID = "1"
+MLFLOW_EXPERIMENT_ID = "resnet152"
+MLFLOW_RUN_NAME = "data_parallel"
