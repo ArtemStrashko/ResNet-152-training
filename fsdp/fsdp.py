@@ -1,22 +1,27 @@
+import functools
 import os
 import random
 import time
 from datetime import datetime
 
 import config as cfg  # Import a custom configuration module (assumed to exist)
+import mlflow
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
+from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, models, transforms
 from tqdm import tqdm
 
-import mlflow
 
-
-class DataParallelFineTune:
+class FsdpFineTune:
     def __init__(
         self,
         model: nn.Module,  # models.resnet152(pretrained=True),
@@ -26,14 +31,18 @@ class DataParallelFineTune:
         learning_rate: float = 1e-4,
         n_data_classes: int = 10,
     ):
-        if isinstance(model, nn.DataParallel):
-            n_input_features = model.module.fc.in_features
-            model.module.fc = torch.nn.Linear(n_input_features, n_data_classes)
-            optimizer = optim.Adam(model.module.fc.parameters(), lr=learning_rate)
-        else:
-            n_input_features = model.fc.in_features
-            model.fc = torch.nn.Linear(n_input_features, n_data_classes)
-            optimizer = optim.Adam(model.fc.parameters(), lr=learning_rate)
+        # if isinstance(model, nn.DataParallel):
+        #     n_input_features = model.module.fc.in_features
+        #     model.module.fc = torch.nn.Linear(n_input_features, n_data_classes)
+        #     optimizer = optim.Adam(model.module.fc.parameters(), lr=learning_rate)
+        # else:
+        #     n_input_features = model.fc.in_features
+        #     model.fc = torch.nn.Linear(n_input_features, n_data_classes)
+        #     optimizer = optim.Adam(model.fc.parameters(), lr=learning_rate)
+
+        n_input_features = model.module.fc.in_features
+        model.module.fc = torch.nn.Linear(n_input_features, n_data_classes)
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
 
         self.model = model
         self.criterion = torch.nn.CrossEntropyLoss()
@@ -41,15 +50,17 @@ class DataParallelFineTune:
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=100)
 
     def train_epoch(
-        self,
-        train_loader: DataLoader,
-        rank: torch.device,
-        do_data_parallel: bool,
+        self, train_loader: DataLoader, epoch: int, rank: torch.device, sampler=None
     ):
         self.model.train()
-        train_loss = 0.0
+        train_loss = torch.zeros(2).to(rank)
+        if sampler:
+            sampler.set_epoch(epoch)
+
         for batch in tqdm(train_loader, leave=False):
             images, real_labels = batch
+            if images.dtype != torch.float32:
+                images = images.float()
             images, real_labels = images.to(rank), real_labels.to(rank)
 
             self.optimizer.zero_grad()
@@ -57,22 +68,19 @@ class DataParallelFineTune:
             raw_logits = self.model(images)
             loss = self.criterion(raw_logits, real_labels)
 
-            if do_data_parallel and torch.cuda.device_count() > 1:
-                loss = loss.mean()  # Compute the mean loss across GPUs
-
             loss.backward()
             self.optimizer.step()
-            train_loss += loss.item()
+            train_loss[0] += loss.item()
+            train_loss[1] += len(batch)
 
         self.scheduler.step()
-
-        avg_train_loss = train_loss / len(train_loader)
-        return avg_train_loss
+        # dist.all_reduce(train_loss, op=dist.ReduceOp.SUM)
 
     def eval(self, eval_data_loader: DataLoader, rank: torch.device):
         self.model.eval()
         total_correct = 0
         total_samples = 0
+        accuracy = torch.zeros(1).to(rank)
 
         with torch.no_grad():
             for batch in tqdm(eval_data_loader, leave=False):
@@ -81,27 +89,15 @@ class DataParallelFineTune:
                 raw_logits = self.model(images)
                 predicted_labels = torch.argmax(raw_logits, dim=1)
                 correct_predictions = (predicted_labels == real_labels).sum().item()
-                total_correct += correct_predictions
-                total_samples += real_labels.size(0)
+                accuracy[0] += correct_predictions
+                # total_correct += correct_predictions
+                # total_samples += real_labels.size(0)
 
-        # Reduce across all GPUs
-        total_correct_tensor = torch.tensor(
-            [total_correct], dtype=torch.float32, device=rank
-        )
-        total_samples_tensor = torch.tensor(
-            [total_samples], dtype=torch.float32, device=rank
-        )
-
-        # Sum the total_correct and total_samples across all GPUs
-        dist.all_reduce(total_correct_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
-
-        # Compute the global accuracy
-        total_correct = total_correct_tensor.item()
-        total_samples = total_samples_tensor.item()
-        accuracy = total_correct / total_samples
-
-        return accuracy
+        dist.all_reduce(accuracy, op=dist.ReduceOp.SUM)
+        if rank == 0:
+            accuracy = accuracy.item()
+            accuracy = total_correct / len(eval_data_loader.dataset)
+            return accuracy
 
     def train_model(
         self,
@@ -121,7 +117,7 @@ class DataParallelFineTune:
         for epoch in range(max_n_epochs):
             n_epochs += 1
             start_time = time.time()
-            _ = self.train_epoch(train_loader, rank, do_data_parallel)
+            self.train_epoch(train_loader, rank, do_data_parallel)
             train_accuracy = self.eval(train_loader, rank)
             val_accuracy = self.eval(val_loader, rank)
             end_time = time.time()
@@ -156,14 +152,15 @@ class DataParallelFineTune:
 
 
 class Imagenette:
-    def get_data_loaders(
+    "Imagenette dataset"
+
+    def __init__(
         self,
-        batch_size: int = 32,
-        num_workers: int = 4,
         train_data_size: int | None = None,
         valid_data_size: int | None = None,
         test_data_size: int | None = None,
     ):
+        "Initialize the datasets."
 
         train_transforms = transforms.Compose(
             [
@@ -211,18 +208,37 @@ class Imagenette:
         )
 
         # Subsample the data if needed.
-        train_dataset = self._subsample(train_dataset, train_data_size)
-        val_dataset = self._subsample(val_dataset, valid_data_size)
-        test_dataset = self._subsample(test_dataset, test_data_size)
+        self.train_dataset = self._subsample(train_dataset, train_data_size)
+        self.val_dataset = self._subsample(val_dataset, valid_data_size)
+        self.test_dataset = self._subsample(test_dataset, test_data_size)
+
+    def get_data_loaders(
+        self,
+        sampler_train,
+        sampler_valid,
+        sampler_test,
+        batch_size: int = 32,
+        num_workers: int = 4,
+    ):
+        "Get the data loaders."
 
         train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+            self.train_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            sampler=sampler_train,
         )
         val_loader = DataLoader(
-            val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+            self.val_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            sampler=sampler_valid,
         )
         test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+            self.test_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            sampler=sampler_test,
         )
 
         return train_loader, val_loader, test_loader
@@ -243,16 +259,28 @@ def set_random_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def data_parallel_main(args: dict):
+def setup():
+    dist.init_process_group("nccl")
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+
+def fsdp_main(args_dict: dict):
 
     set_random_seed(1234)
-    do_data_parallel = args["do_data_parallel"]
-    batch_size = args["batch_size"]
-    max_n_epochs = args["max_n_epochs"]
-    learning_rate = args["learning_rate"]
-    train_data_size = args["train_data_size"]
-    test_data_size = args["test_data_size"]
-    valid_data_size = args["valid_data_size"]
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    batch_size = args_dict["per_device_batch_size"]
+    max_n_epochs = args_dict["max_n_epochs"]
+    learning_rate = args_dict["learning_rate"]
+    train_data_size = args_dict["train_data_size"]
+    test_data_size = args_dict["test_data_size"]
+    valid_data_size = args_dict["valid_data_size"]
 
     # Log parameters to mlflow.
     mlflow.log_param("learning_rate", learning_rate)
@@ -262,31 +290,55 @@ def data_parallel_main(args: dict):
     mlflow.log_param("test_data_size", test_data_size)
     mlflow.log_param("valid_data_size", valid_data_size)
 
-    # Load the model.
-    model = models.resnet152(weights=models.ResNet152_Weights.DEFAULT)
-    if do_data_parallel and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model, device_ids=cfg.visible_devices)
-
-    mlflow.log_param("do_data_parallel", do_data_parallel)
-    mlflow.log_param("n_GPUs", torch.cuda.device_count())
-
-    # Load the data loaders.
-    dataset = Imagenette()
-    (train_loader, val_loader, test_loader) = dataset.get_data_loaders(
-        batch_size=batch_size,
+    # Load the data set.
+    dataset = Imagenette(
         train_data_size=train_data_size,
         valid_data_size=valid_data_size,
         test_data_size=test_data_size,
     )
 
+    # Create samplers.
+    sampler_train = DistributedSampler(
+        dataset.train_dataset, rank=rank, num_replicas=world_size, shuffle=True
+    )
+    sampler_valid = DistributedSampler(
+        dataset.val_dataset, rank=rank, num_replicas=world_size, shuffle=False
+    )
+    sampler_test = DistributedSampler(
+        dataset.test_dataset, rank=rank, num_replicas=world_size, shuffle=False
+    )
+
+    setup()
+    (train_loader, val_loader, test_loader) = dataset.get_data_loaders(
+        batch_size=batch_size,
+        sampler_train=sampler_train,
+        sampler_valid=sampler_valid,
+        sampler_test=sampler_test,
+    )
+
+    my_auto_wrap_policy = functools.partial(
+        size_based_auto_wrap_policy, min_num_params=100
+    )
+
+    # Load the model.
+    model = models.resnet152(weights=models.ResNet152_Weights.DEFAULT)
+    torch.cuda.set_device(local_rank)
+    torch.cuda.set_per_process_memory_fraction(cfg.MEMORY_LIMIT)
+
+    model = FSDP(
+        model,
+        auto_wrap_policy=my_auto_wrap_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=torch.cuda.current_device(),
+    )
+
+    mlflow.log_param("n_GPUs", torch.cuda.device_count())
+
     # Initialize the trainer.
-    trainer = DataParallelFineTune(model=model, learning_rate=learning_rate)
+    trainer = FsdpFineTune(model=model, learning_rate=learning_rate)
 
     # Training loop
-    rank = torch.device(args["device"])  # Get the device for training
-    torch.cuda.set_per_process_memory_fraction(cfg.memory_limit)
-    model.to(rank)  # Move the model to the specified device
-    print("Training on " + str(rank))  # Print the device being used for training
+    torch.cuda.set_per_process_memory_fraction(cfg.MEMORY_LIMIT)
     start_time = datetime.now()  # Record the start time for training
 
     train_acc, val_acc, epochs = trainer.train_model(
@@ -294,7 +346,6 @@ def data_parallel_main(args: dict):
         val_loader=val_loader,
         rank=rank,
         max_n_epochs=max_n_epochs,
-        do_data_parallel=do_data_parallel,
     )
 
     end_time = datetime.now()
@@ -306,48 +357,37 @@ def data_parallel_main(args: dict):
     mlflow.log_metric("final_test_acc", test_acc)
     mlflow.log_metric("time_per_epoch", ((end_time - start_time).seconds) / epochs)
 
+    dist.barrier()
+    cleanup()
+
 
 if __name__ == "__main__":
 
-    total_devices = len(cfg.visible_devices) if cfg.do_data_parallel else 1
-    print(f"Training on {total_devices} devices")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    total_devices = int(os.environ["WORLD_SIZE"])
 
-    os.environ["RANK"] = (
-        "0"  # Set this to 0 for the master process (or a unique rank for each process)
-    )
-    os.environ["WORLD_SIZE"] = "1"  # Set this to the total number of nodes.
-    os.environ["MASTER_ADDR"] = (
-        "localhost"  # The IP address of the master node (can be localhost for a single machine)
-    )
-    os.environ["MASTER_PORT"] = "12355"  # Any open port number
+    if local_rank == 0:
+        print(f"Training on {total_devices} devices")
 
-    dist.init_process_group(backend="nccl")
+    batch_size = cfg.PER_DEVICE_BATCH_SIZE * total_devices
 
-    batch_size = cfg.per_device_batch_size * total_devices
-
-    print("Per Device Batch Size = ", cfg.per_device_batch_size)
-    print("Total Effective Batch Size = ", batch_size)
-
-    print("Training on", total_devices, "GPUs")
+    if local_rank == 0:
+        print("Per Device Batch Size = ", cfg.PER_DEVICE_BATCH_SIZE)
+        print("Total Effective Batch Size = ", batch_size)
 
     args = {
-        "do_data_parallel": cfg.do_data_parallel,
-        "batch_size": batch_size,
-        "learning_rate": cfg.learning_rate,
-        "max_n_epochs": cfg.max_n_epochs,
-        "train_data_size": cfg.train_data_size,
-        "test_data_size": cfg.test_data_size,
-        "valid_data_size": cfg.valid_data_size,
-        "device": cfg.device,
+        "per_device_batch_size": cfg.PER_DEVICE_BATCH_SIZE,
+        "learning_rate": cfg.LEARNING_RATE,
+        "max_n_epochs": cfg.MAX_N_EPOCHS,
+        "train_data_size": cfg.TRAIN_DATA_SIZE,
+        "test_data_size": cfg.TEST_DATA_SIZE,
+        "valid_data_size": cfg.VALID_DATA_SIZE,
     }
-
     mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
     mlflow.set_experiment(cfg.MLFLOW_EXPERIMENT_ID)
     with mlflow.start_run(run_name=cfg.MLFLOW_RUN_NAME):
         mlflow.log_params(args)
-
-        data_parallel_main(args)
+        fsdp_main(args)
         max_memory_consumed = round(torch.cuda.max_memory_allocated() / 1e9, 2)
-        mlflow.log_metric("max_memory_per_device_GB", max_memory_consumed)
-
-    dist.destroy_process_group()
+        if local_rank == 0:
+            mlflow.log_metric("max_memory_per_device_GB", max_memory_consumed)

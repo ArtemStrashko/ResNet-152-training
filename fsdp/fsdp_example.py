@@ -1,40 +1,28 @@
-# Import necessary libraries and modules
-import functools  # Import the functools module for higher-order functions
-import os  # Import the os module for operating system-related functions
+import functools
+import os
 
-import config as cfg  # Import a custom configuration module (assumed to exist)
-import torch  # Import PyTorch
-import torch.distributed as dist  # Import PyTorch's distributed module
-import torch.multiprocessing as mp  # Import the multiprocessing module
-from datasets import load_dataset  # Import a function to load datasets
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-)  # Import FullyShardedDataParallel and ShardingStrategy from FSDP
+import config as cfg
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from datasets import load_dataset
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    CPUOffload,
-)  # Import CPUOffload from FSDP
-from torch.distributed.fsdp.wrap import (
-    size_based_auto_wrap_policy,
-)  # Import size_based_auto_wrap_policy from FSDP
-from torch.utils.data import (  # Import PyTorch data loading utilities
-    DataLoader,
-    TensorDataset,
-)
-from torch.utils.data.distributed import (
-    DistributedSampler,
-)  # Import DistributedSampler for distributed data loading
-from tqdm import tqdm  # Import tqdm for progress tracking
-from transformers import (  # Import various components from Hugging Face Transformers
+from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
+from transformers import (
     AdamW,
     AutoTokenizer,
     BertForSequenceClassification,
     BertModel,
     get_linear_schedule_with_warmup,
 )
-from transformers.models.bert.modeling_bert import (
+from transformers.models.bert.modeling_bert import (  # Import BertLayer from Transformers
     BertLayer,
-)  # Import BertLayer from Transformers
+)
 
 
 # Initialize the distributed process group

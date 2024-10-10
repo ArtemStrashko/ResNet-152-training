@@ -1,13 +1,14 @@
-# Define hyperparameters
-do_data_parallel = True
+MEMORY_LIMIT = 1.0
 
-per_device_batch_size = 1
-learning_rate = 2e-5
-epochs = 1
+PER_DEVICE_BATCH_SIZE = 16
+LEARNING_RATE = 2e-5
+MAX_N_EPOCHS = 10
 
-train_data_size = 200
-test_data_size = 20
-max_length = 512
-model_name = "bert-large-uncased"
+TRAIN_DATA_SIZE = 1000
+VALID_DATA_SIZE = 200
+TEST_DATA_SIZE = 200
 
-memory_limit = 1.0
+
+MLFLOW_TRACKING_URI = "http://localhost:5001"
+MLFLOW_EXPERIMENT_ID = "resnet152"
+MLFLOW_RUN_NAME = "data_parallel"
