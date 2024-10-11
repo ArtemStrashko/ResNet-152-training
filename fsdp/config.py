@@ -11,4 +11,4 @@ TEST_DATA_SIZE = 200
 
 MLFLOW_TRACKING_URI = "http://localhost:5001"
 MLFLOW_EXPERIMENT_ID = "resnet152"
-MLFLOW_RUN_NAME = "data_parallel"
+MLFLOW_RUN_NAME = "fspd"

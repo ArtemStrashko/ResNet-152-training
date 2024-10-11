@@ -31,17 +31,8 @@ class FsdpFineTune:
         learning_rate: float = 1e-4,
         n_data_classes: int = 10,
     ):
-        # if isinstance(model, nn.DataParallel):
-        #     n_input_features = model.module.fc.in_features
-        #     model.module.fc = torch.nn.Linear(n_input_features, n_data_classes)
-        #     optimizer = optim.Adam(model.module.fc.parameters(), lr=learning_rate)
-        # else:
-        #     n_input_features = model.fc.in_features
-        #     model.fc = torch.nn.Linear(n_input_features, n_data_classes)
-        #     optimizer = optim.Adam(model.fc.parameters(), lr=learning_rate)
-
-        n_input_features = model.module.fc.in_features
-        model.module.fc = torch.nn.Linear(n_input_features, n_data_classes)
+        n_input_features = model.fc.in_features
+        model.fc = torch.nn.Linear(n_input_features, n_data_classes)
         optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
 
         self.model = model
@@ -49,18 +40,11 @@ class FsdpFineTune:
         self.optimizer = optimizer
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=100)
 
-    def train_epoch(
-        self, train_loader: DataLoader, epoch: int, rank: torch.device, sampler=None
-    ):
+    def train_epoch(self, train_loader: DataLoader, rank: torch.device):
         self.model.train()
-        train_loss = torch.zeros(2).to(rank)
-        if sampler:
-            sampler.set_epoch(epoch)
 
         for batch in tqdm(train_loader, leave=False):
             images, real_labels = batch
-            if images.dtype != torch.float32:
-                images = images.float()
             images, real_labels = images.to(rank), real_labels.to(rank)
 
             self.optimizer.zero_grad()
@@ -70,16 +54,14 @@ class FsdpFineTune:
 
             loss.backward()
             self.optimizer.step()
-            train_loss[0] += loss.item()
-            train_loss[1] += len(batch)
+            # train_loss[0] += loss.item()
+            # train_loss[1] += len(batch)
 
         self.scheduler.step()
         # dist.all_reduce(train_loss, op=dist.ReduceOp.SUM)
 
     def eval(self, eval_data_loader: DataLoader, rank: torch.device):
         self.model.eval()
-        total_correct = 0
-        total_samples = 0
         accuracy = torch.zeros(1).to(rank)
 
         with torch.no_grad():
@@ -90,14 +72,12 @@ class FsdpFineTune:
                 predicted_labels = torch.argmax(raw_logits, dim=1)
                 correct_predictions = (predicted_labels == real_labels).sum().item()
                 accuracy[0] += correct_predictions
-                # total_correct += correct_predictions
-                # total_samples += real_labels.size(0)
 
         dist.all_reduce(accuracy, op=dist.ReduceOp.SUM)
-        if rank == 0:
-            accuracy = accuracy.item()
-            accuracy = total_correct / len(eval_data_loader.dataset)
-            return accuracy
+        return accuracy.item() / len(eval_data_loader.dataset)
+        # if rank == 0:
+        #     accuracy = accuracy.item() / len(eval_data_loader.dataset)
+        #     return accuracy
 
     def train_model(
         self,
@@ -107,7 +87,6 @@ class FsdpFineTune:
         max_n_epochs: int = 100,
         patience: int = 10,
         early_stopping: bool = True,
-        do_data_parallel: bool = True,
     ):
 
         best_val_acc = 0.0
@@ -117,14 +96,15 @@ class FsdpFineTune:
         for epoch in range(max_n_epochs):
             n_epochs += 1
             start_time = time.time()
-            self.train_epoch(train_loader, rank, do_data_parallel)
+            self.train_epoch(train_loader, rank)
             train_accuracy = self.eval(train_loader, rank)
             val_accuracy = self.eval(val_loader, rank)
             end_time = time.time()
             time_taken = end_time - start_time
-            print(
-                f"Epoch {epoch + 1}: train_acc = {train_accuracy * 100:.2f}%, val_acc = {val_accuracy * 100:.2f}%, time = {time_taken:.1f} sec."
-            )
+            if rank == 0:
+                print(
+                    f"Epoch {epoch + 1}: train_acc = {train_accuracy * 100:.2f}%, val_acc = {val_accuracy * 100:.2f}%, time = {time_taken:.1f} sec."
+                )
             self._log_metrics(
                 epoch=epoch,
                 train_accuracy=train_accuracy,
@@ -154,11 +134,15 @@ class FsdpFineTune:
 class Imagenette:
     "Imagenette dataset"
 
-    def __init__(
+    def get_data_loaders(
         self,
+        rank: torch.device,
+        world_size: int,
         train_data_size: int | None = None,
         valid_data_size: int | None = None,
         test_data_size: int | None = None,
+        batch_size: int = 32,
+        num_workers: int = 4,
     ):
         "Initialize the datasets."
 
@@ -208,34 +192,35 @@ class Imagenette:
         )
 
         # Subsample the data if needed.
-        self.train_dataset = self._subsample(train_dataset, train_data_size)
-        self.val_dataset = self._subsample(val_dataset, valid_data_size)
-        self.test_dataset = self._subsample(test_dataset, test_data_size)
+        train_dataset = self._subsample(train_dataset, train_data_size)
+        val_dataset = self._subsample(val_dataset, valid_data_size)
+        test_dataset = self._subsample(test_dataset, test_data_size)
 
-    def get_data_loaders(
-        self,
-        sampler_train,
-        sampler_valid,
-        sampler_test,
-        batch_size: int = 32,
-        num_workers: int = 4,
-    ):
-        "Get the data loaders."
+        # Create samplers.
+        sampler_train = DistributedSampler(
+            train_dataset, rank=rank, num_replicas=world_size, shuffle=True
+        )
+        sampler_valid = DistributedSampler(
+            val_dataset, rank=rank, num_replicas=world_size, shuffle=False
+        )
+        sampler_test = DistributedSampler(
+            test_dataset, rank=rank, num_replicas=world_size, shuffle=False
+        )
 
         train_loader = DataLoader(
-            self.train_dataset,
+            train_dataset,
             batch_size=batch_size,
             num_workers=num_workers,
             sampler=sampler_train,
         )
         val_loader = DataLoader(
-            self.val_dataset,
+            val_dataset,
             batch_size=batch_size,
             num_workers=num_workers,
             sampler=sampler_valid,
         )
         test_loader = DataLoader(
-            self.test_dataset,
+            test_dataset,
             batch_size=batch_size,
             num_workers=num_workers,
             sampler=sampler_test,
@@ -290,31 +275,17 @@ def fsdp_main(args_dict: dict):
     mlflow.log_param("test_data_size", test_data_size)
     mlflow.log_param("valid_data_size", valid_data_size)
 
-    # Load the data set.
-    dataset = Imagenette(
+    dataset = Imagenette()
+    train_loader, val_loader, test_loader = dataset.get_data_loaders(
+        rank=rank,
+        world_size=world_size,
         train_data_size=train_data_size,
         valid_data_size=valid_data_size,
         test_data_size=test_data_size,
-    )
-
-    # Create samplers.
-    sampler_train = DistributedSampler(
-        dataset.train_dataset, rank=rank, num_replicas=world_size, shuffle=True
-    )
-    sampler_valid = DistributedSampler(
-        dataset.val_dataset, rank=rank, num_replicas=world_size, shuffle=False
-    )
-    sampler_test = DistributedSampler(
-        dataset.test_dataset, rank=rank, num_replicas=world_size, shuffle=False
+        batch_size=batch_size,
     )
 
     setup()
-    (train_loader, val_loader, test_loader) = dataset.get_data_loaders(
-        batch_size=batch_size,
-        sampler_train=sampler_train,
-        sampler_valid=sampler_valid,
-        sampler_test=sampler_test,
-    )
 
     my_auto_wrap_policy = functools.partial(
         size_based_auto_wrap_policy, min_num_params=100
@@ -330,6 +301,7 @@ def fsdp_main(args_dict: dict):
         auto_wrap_policy=my_auto_wrap_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
+        cpu_offload=CPUOffload(offload_params=True),
     )
 
     mlflow.log_param("n_GPUs", torch.cuda.device_count())
