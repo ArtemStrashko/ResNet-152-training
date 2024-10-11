@@ -5,7 +5,6 @@ import time
 from datetime import datetime
 
 import config as cfg  # Import a custom configuration module (assumed to exist)
-import mlflow
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -20,14 +19,17 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, models, transforms
 from tqdm import tqdm
 
+import mlflow
+
 
 class FsdpFineTune:
+    """
+    Basic class for fine-tuning a model using FSDP (Fully Sharded Data Parallel).
+    """
+
     def __init__(
         self,
-        model: nn.Module,  # models.resnet152(pretrained=True),
-        #  optimizer=None,
-        #  criterion=None,
-        #  scheduler=None,
+        model: nn.Module,
         learning_rate: float = 1e-4,
         n_data_classes: int = 10,
     ):
@@ -40,8 +42,10 @@ class FsdpFineTune:
         self.optimizer = optimizer
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=100)
 
-    def train_epoch(self, train_loader: DataLoader, rank: torch.device):
+    def train_epoch(self, train_loader: DataLoader, rank: torch.device, epoch: int):
+        "Train the model for one epoch."
         self.model.train()
+        train_loader.sampler.set_epoch(epoch)
 
         for batch in tqdm(train_loader, leave=False):
             images, real_labels = batch
@@ -54,15 +58,14 @@ class FsdpFineTune:
 
             loss.backward()
             self.optimizer.step()
-            # train_loss[0] += loss.item()
-            # train_loss[1] += len(batch)
 
         self.scheduler.step()
-        # dist.all_reduce(train_loss, op=dist.ReduceOp.SUM)
 
     def eval(self, eval_data_loader: DataLoader, rank: torch.device):
+        "Evaluate the model on the given data loader."
         self.model.eval()
-        accuracy = torch.zeros(1).to(rank)
+        correct = torch.tensor(0).to(rank)
+        total = torch.tensor(0).to(rank)
 
         with torch.no_grad():
             for batch in tqdm(eval_data_loader, leave=False):
@@ -70,14 +73,18 @@ class FsdpFineTune:
                 images, real_labels = images.to(rank), real_labels.to(rank)
                 raw_logits = self.model(images)
                 predicted_labels = torch.argmax(raw_logits, dim=1)
-                correct_predictions = (predicted_labels == real_labels).sum().item()
-                accuracy[0] += correct_predictions
+                correct += (predicted_labels == real_labels).sum().item()
+                total += len(real_labels)
 
-        dist.all_reduce(accuracy, op=dist.ReduceOp.SUM)
-        return accuracy.item() / len(eval_data_loader.dataset)
-        # if rank == 0:
-        #     accuracy = accuracy.item() / len(eval_data_loader.dataset)
-        #     return accuracy
+        # Reduce the sums to rank 0
+        dist.reduce(correct, dst=0, op=dist.ReduceOp.SUM)
+        dist.reduce(total, dst=0, op=dist.ReduceOp.SUM)
+
+        if rank == 0:
+            accuracy = correct.float() / total
+            return accuracy.item()
+        else:
+            return None  # Other ranks return None
 
     def train_model(
         self,
@@ -88,6 +95,7 @@ class FsdpFineTune:
         patience: int = 10,
         early_stopping: bool = True,
     ):
+        "Train the model for multiple epochs."
 
         best_val_acc = 0.0
         epochs_to_improve = 0
@@ -96,39 +104,57 @@ class FsdpFineTune:
         for epoch in range(max_n_epochs):
             n_epochs += 1
             start_time = time.time()
-            self.train_epoch(train_loader, rank)
+            self.train_epoch(train_loader=train_loader, rank=rank, epoch=epoch)
             train_accuracy = self.eval(train_loader, rank)
             val_accuracy = self.eval(val_loader, rank)
             end_time = time.time()
             time_taken = end_time - start_time
             if rank == 0:
                 print(
-                    f"Epoch {epoch + 1}: train_acc = {train_accuracy * 100:.2f}%, val_acc = {val_accuracy * 100:.2f}%, time = {time_taken:.1f} sec."
+                    f"Epoch {epoch + 1}: train_acc = {train_accuracy * 100:.2f}%, "
+                    f"val_acc = {val_accuracy * 100:.2f}%, "
+                    f"time = {time_taken:.1f} sec."
                 )
-            self._log_metrics(
-                epoch=epoch,
-                train_accuracy=train_accuracy,
-                val_accuracy=val_accuracy,
-                time_taken=time_taken,
-            )
+                self._log_metrics(
+                    epoch=epoch,
+                    train_accuracy=train_accuracy,
+                    val_accuracy=val_accuracy,
+                    time_taken=time_taken,
+                )
 
-            if val_accuracy > best_val_acc * 1.01:
-                best_val_acc = val_accuracy
-                epochs_to_improve = 0
+                if val_accuracy > best_val_acc * 1.01:
+                    best_val_acc = val_accuracy
+                    epochs_to_improve = 0
+                else:
+                    epochs_to_improve += 1
+
+                early_stop = epochs_to_improve >= patience and early_stopping
             else:
-                epochs_to_improve += 1
+                early_stop = False
 
-            if epochs_to_improve >= patience and early_stopping:
-                print(f"Early stopping at epoch {epoch + 1}")
+            # Broadcast the early_stop signal to all ranks
+            early_stop = torch.tensor(early_stop or 0).to(rank)
+            dist.broadcast(early_stop, src=0)
+            early_stop = bool(early_stop.item())
+
+            if early_stop:
+                if rank == 0:
+                    print(f"Early stopping at epoch {epoch + 1}")
                 break
-        return train_accuracy, val_accuracy, n_epochs
+        # return train_accuracy, val_accuracy, n_epochs
+        if rank == 0:
+            return train_accuracy, val_accuracy, n_epochs
+        else:
+            return None, None, n_epochs
 
     def _log_metrics(
         self, epoch: int, train_accuracy: float, val_accuracy: float, time_taken: float
     ):
-        mlflow.log_metric("train_accuracy", train_accuracy, step=epoch)
-        mlflow.log_metric("val_accuracy", val_accuracy, step=epoch)
-        mlflow.log_metric("time_taken", time_taken, step=epoch)
+        rank = int(os.environ["RANK"])
+        if rank == 0:
+            mlflow.log_metric("train_accuracy", train_accuracy, step=epoch)
+            mlflow.log_metric("val_accuracy", val_accuracy, step=epoch)
+            mlflow.log_metric("time_taken", time_taken, step=epoch)
 
 
 class Imagenette:
@@ -144,7 +170,16 @@ class Imagenette:
         batch_size: int = 32,
         num_workers: int = 4,
     ):
-        "Initialize the datasets."
+        "Creates distributed data loaders."
+
+        train_dir = os.path.expanduser("~/imagenette2/train")
+        val_dir = os.path.expanduser("~/imagenette2/val")
+        # check if these directories exist
+        if not os.path.exists(train_dir) or not os.path.exists(val_dir):
+            print("The data may not be downloaded. Download as follows:")
+            print("wget https://s3.amazonaws.com/fast-ai-imageclas/imagenette2.tgz")
+            print("tar -xvzf imagenette2.tgz")
+            raise FileNotFoundError(f"{train_dir} or {val_dir} does not exist")
 
         train_transforms = transforms.Compose(
             [
@@ -171,15 +206,6 @@ class Imagenette:
                 ),
             ]
         )
-
-        train_dir = os.path.expanduser("~/imagenette2/train")
-        val_dir = os.path.expanduser("~/imagenette2/val")
-        # check if these directories exist
-        if not os.path.exists(train_dir) or not os.path.exists(val_dir):
-            print("The data may not be downloaded. Download as follows:")
-            print("wget https://s3.amazonaws.com/fast-ai-imageclas/imagenette2.tgz")
-            print("tar -xvzf imagenette2.tgz")
-            raise FileNotFoundError(f"{train_dir} or {val_dir} does not exist")
 
         train_dataset = datasets.ImageFolder(train_dir, transform=train_transforms)
         val_test_dataset = datasets.ImageFolder(val_dir, transform=val_transforms)
@@ -245,20 +271,35 @@ def set_random_seed(seed: int):
 
 
 def setup():
+    """
+    Initializes the process group using the NCCL backend, which allows distributed
+    processes running on different GPUs to communicate efficiently during the training
+    process. Here nccl statnds for NVIDIA Collective Communications Library.
+
+    This function should be called once at the beginning of the program.
+    """
     dist.init_process_group("nccl")
 
 
 def cleanup():
+    """
+    Cleans up the process group (distributed environment) and releases the resources
+    associated with it.
+    """
+
     dist.destroy_process_group()
 
 
 def fsdp_main(args_dict: dict):
+    "Main function for training a model using FSDP."
 
     set_random_seed(1234)
 
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
+
+    setup()
 
     batch_size = args_dict["per_device_batch_size"]
     max_n_epochs = args_dict["max_n_epochs"]
@@ -268,12 +309,14 @@ def fsdp_main(args_dict: dict):
     valid_data_size = args_dict["valid_data_size"]
 
     # Log parameters to mlflow.
-    mlflow.log_param("learning_rate", learning_rate)
-    mlflow.log_param("batch_size", batch_size)
-    mlflow.log_param("max_n_epochs", max_n_epochs)
-    mlflow.log_param("train_data_size", train_data_size)
-    mlflow.log_param("test_data_size", test_data_size)
-    mlflow.log_param("valid_data_size", valid_data_size)
+    if rank == 0:
+        mlflow.log_param("learning_rate", learning_rate)
+        mlflow.log_param("batch_size", batch_size)
+        mlflow.log_param("max_n_epochs", max_n_epochs)
+        mlflow.log_param("train_data_size", train_data_size)
+        mlflow.log_param("test_data_size", test_data_size)
+        mlflow.log_param("valid_data_size", valid_data_size)
+        mlflow.log_param("n_GPUs", torch.cuda.device_count())
 
     dataset = Imagenette()
     train_loader, val_loader, test_loader = dataset.get_data_loaders(
@@ -285,7 +328,9 @@ def fsdp_main(args_dict: dict):
         batch_size=batch_size,
     )
 
-    setup()
+    # Set device and memory limit
+    torch.cuda.set_device(local_rank)
+    torch.cuda.set_per_process_memory_fraction(cfg.MEMORY_LIMIT)
 
     my_auto_wrap_policy = functools.partial(
         size_based_auto_wrap_policy, min_num_params=100
@@ -293,8 +338,6 @@ def fsdp_main(args_dict: dict):
 
     # Load the model.
     model = models.resnet152(weights=models.ResNet152_Weights.DEFAULT)
-    torch.cuda.set_device(local_rank)
-    torch.cuda.set_per_process_memory_fraction(cfg.MEMORY_LIMIT)
 
     model = FSDP(
         model,
@@ -304,14 +347,23 @@ def fsdp_main(args_dict: dict):
         cpu_offload=CPUOffload(offload_params=True),
     )
 
-    mlflow.log_param("n_GPUs", torch.cuda.device_count())
+    # Comments.
+    # 1. The auto_wrap_policy ensures that layers with more than 100 parameters
+    # are automatically sharded by FSDP. This policy is useful for large models
+    # like ResNet-152, which contain many layers, allowing the framework to handle
+    # only the larger layers that will benefit most from sharding.
+    # 2. ShardingStrategy.FULL_SHARD means that FSDP will fully shard the model's parameters,
+    # gradients, and optimizer states across all devices (GPUs). This maximizes memory savings.
+    # 3. With cpu_offload=CPUOffload(offload_params=True), model parameters are moved to the CPU
+    # when not in use, freeing up GPU memory for active computations. This can be beneficial in
+    # environments with limited GPU memory. However, it can slow down training due to the extra
+    # data transfer between CPU and GPU.
 
     # Initialize the trainer.
     trainer = FsdpFineTune(model=model, learning_rate=learning_rate)
 
     # Training loop
-    torch.cuda.set_per_process_memory_fraction(cfg.MEMORY_LIMIT)
-    start_time = datetime.now()  # Record the start time for training
+    start_time = datetime.now()
 
     train_acc, val_acc, epochs = trainer.train_model(
         train_loader=train_loader,
@@ -324,12 +376,15 @@ def fsdp_main(args_dict: dict):
 
     test_acc = trainer.eval(test_loader, rank)
 
-    mlflow.log_metric("final_train_acc", train_acc)
-    mlflow.log_metric("final_val_acc", val_acc)
-    mlflow.log_metric("final_test_acc", test_acc)
-    mlflow.log_metric("time_per_epoch", ((end_time - start_time).seconds) / epochs)
+    if rank == 0:
+        mlflow.log_metric("final_train_acc", train_acc)
+        mlflow.log_metric("final_val_acc", val_acc)
+        mlflow.log_metric("final_test_acc", test_acc)
+        mlflow.log_metric("time_per_epoch", ((end_time - start_time).seconds) / epochs)
+        max_memory_consumed = round(torch.cuda.max_memory_allocated() / 1e9, 2)
+        mlflow.log_metric("max_memory_per_device_GB", max_memory_consumed)
 
-    dist.barrier()
+    dist.barrier()  # Synchronize all distributed processes
     cleanup()
 
 
@@ -355,11 +410,15 @@ if __name__ == "__main__":
         "test_data_size": cfg.TEST_DATA_SIZE,
         "valid_data_size": cfg.VALID_DATA_SIZE,
     }
-    mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(cfg.MLFLOW_EXPERIMENT_ID)
-    with mlflow.start_run(run_name=cfg.MLFLOW_RUN_NAME):
+
+    # Initialize MLflow only on rank 0
+    if local_rank == 0:
+        mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
+        mlflow.set_experiment(cfg.MLFLOW_EXPERIMENT_ID)
+        mlflow.start_run(run_name=cfg.MLFLOW_RUN_NAME)
         mlflow.log_params(args)
-        fsdp_main(args)
-        max_memory_consumed = round(torch.cuda.max_memory_allocated() / 1e9, 2)
-        if local_rank == 0:
-            mlflow.log_metric("max_memory_per_device_GB", max_memory_consumed)
+
+    fsdp_main(args)
+
+    if local_rank == 0:
+        mlflow.end_run()

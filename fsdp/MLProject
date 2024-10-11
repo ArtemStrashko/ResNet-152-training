@@ -1,0 +1,7 @@
+name: ResNet-152 FSDP Training
+
+python_env: dependencies.txt
+
+entry_points:
+  train:
+    command: "torchrun --nnodes 1 --nproc_per_node 4 /ResNet-152-training/fsdp.py"
