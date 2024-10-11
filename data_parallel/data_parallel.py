@@ -257,7 +257,7 @@ def data_parallel_main(args: dict):
     # Load the model and wrap it in DataParallel if needed and multiple GPUs are available.
     model = models.resnet152(weights=models.ResNet152_Weights.DEFAULT)
     if do_data_parallel and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model, device_ids=cfg.visible_devices)
+        model = nn.DataParallel(model, device_ids=cfg.VISIBLE_DEVICES)
 
     mlflow.log_param("do_data_parallel", do_data_parallel)
     mlflow.log_param("n_GPUs", torch.cuda.device_count())
@@ -276,7 +276,7 @@ def data_parallel_main(args: dict):
 
     # Training loop
     rank = torch.device(args["device"])  # Get the device for training
-    torch.cuda.set_per_process_memory_fraction(cfg.memory_limit)
+    torch.cuda.set_per_process_memory_fraction(cfg.MEMORY_LIMIT)
     model.to(rank)  # Move the model to the specified device
     print("Training on " + str(rank))  # Print the device being used for training
     start_time = datetime.now()
@@ -300,7 +300,7 @@ def data_parallel_main(args: dict):
 
 if __name__ == "__main__":
 
-    total_devices = len(cfg.visible_devices) if cfg.do_data_parallel else 1
+    total_devices = len(cfg.VISIBLE_DEVICES) if cfg.DO_DATA_PARALLEL else 1
     print(f"Training on {total_devices} devices")
 
     os.environ["RANK"] = (
@@ -312,22 +312,22 @@ if __name__ == "__main__":
     )
     os.environ["MASTER_PORT"] = "12355"  # Any open port number
 
-    batch_size = cfg.per_device_batch_size * total_devices
+    batch_size = cfg.PER_DEVICE_BATCH_SIZE * total_devices
 
-    print("Per Device Batch Size = ", cfg.per_device_batch_size)
+    print("Per Device Batch Size = ", cfg.PER_DEVICE_BATCH_SIZE)
     print("Total Effective Batch Size = ", batch_size)
 
     print("Training on", total_devices, "GPUs")
 
     args = {
-        "do_data_parallel": cfg.do_data_parallel,
+        "do_data_parallel": cfg.DO_DATA_PARALLEL,
         "batch_size": batch_size,
-        "learning_rate": cfg.learning_rate,
-        "max_n_epochs": cfg.max_n_epochs,
-        "train_data_size": cfg.train_data_size,
-        "test_data_size": cfg.test_data_size,
-        "valid_data_size": cfg.valid_data_size,
-        "device": cfg.device,
+        "learning_rate": cfg.LEARNING_RATE,
+        "max_n_epochs": cfg.MAX_N_EPOCHS,
+        "train_data_size": cfg.TRAIN_DATA_SIZE,
+        "test_data_size": cfg.TEST_DATA_SIZE,
+        "valid_data_size": cfg.VALID_DATA_SIZE,
+        "device": cfg.DEVICE,
     }
 
     mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
