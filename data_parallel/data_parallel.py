@@ -5,7 +5,6 @@ from datetime import datetime
 
 import config as cfg  # Import a custom configuration module (assumed to exist)
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -17,9 +16,11 @@ import mlflow
 
 
 class DataParallelFineTune:
+    "Basic class to fine-tune a model using data parallelism."
+
     def __init__(
         self,
-        model: nn.Module,  # models.resnet152(pretrained=True),
+        model: nn.Module,
         #  optimizer=None,
         #  criterion=None,
         #  scheduler=None,
@@ -44,8 +45,8 @@ class DataParallelFineTune:
         self,
         train_loader: DataLoader,
         rank: torch.device,
-        do_data_parallel: bool,
     ):
+        "Train the model for one epoch."
         self.model.train()
         train_loss = 0.0
         for batch in tqdm(train_loader, leave=False):
@@ -57,9 +58,6 @@ class DataParallelFineTune:
             raw_logits = self.model(images)
             loss = self.criterion(raw_logits, real_labels)
 
-            if do_data_parallel and torch.cuda.device_count() > 1:
-                loss = loss.mean()  # Compute the mean loss across GPUs
-
             loss.backward()
             self.optimizer.step()
             train_loss += loss.item()
@@ -70,6 +68,7 @@ class DataParallelFineTune:
         return avg_train_loss
 
     def eval(self, eval_data_loader: DataLoader, rank: torch.device):
+        "Evaluate the model on the validation or test set."
         self.model.eval()
         total_correct = 0
         total_samples = 0
@@ -84,23 +83,7 @@ class DataParallelFineTune:
                 total_correct += correct_predictions
                 total_samples += real_labels.size(0)
 
-        # Reduce across all GPUs
-        total_correct_tensor = torch.tensor(
-            [total_correct], dtype=torch.float32, device=rank
-        )
-        total_samples_tensor = torch.tensor(
-            [total_samples], dtype=torch.float32, device=rank
-        )
-
-        # Sum the total_correct and total_samples across all GPUs
-        dist.all_reduce(total_correct_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
-
-        # Compute the global accuracy
-        total_correct = total_correct_tensor.item()
-        total_samples = total_samples_tensor.item()
         accuracy = total_correct / total_samples
-
         return accuracy
 
     def train_model(
@@ -111,9 +94,8 @@ class DataParallelFineTune:
         max_n_epochs: int = 100,
         patience: int = 10,
         early_stopping: bool = True,
-        do_data_parallel: bool = True,
     ):
-
+        "Train the model for multiple epochs."
         best_val_acc = 0.0
         epochs_to_improve = 0
         n_epochs = 0
@@ -121,14 +103,17 @@ class DataParallelFineTune:
         for epoch in range(max_n_epochs):
             n_epochs += 1
             start_time = time.time()
-            _ = self.train_epoch(train_loader, rank, do_data_parallel)
+            _ = self.train_epoch(train_loader, rank)
             train_accuracy = self.eval(train_loader, rank)
             val_accuracy = self.eval(val_loader, rank)
             end_time = time.time()
             time_taken = end_time - start_time
             print(
-                f"Epoch {epoch + 1}: train_acc = {train_accuracy * 100:.2f}%, val_acc = {val_accuracy * 100:.2f}%, time = {time_taken:.1f} sec."
+                f"Epoch {epoch + 1}: train_acc = {train_accuracy * 100:.2f}%, "
+                f"val_acc = {val_accuracy * 100:.2f}%, "
+                f"time = {time_taken:.1f} sec."
             )
+
             self._log_metrics(
                 epoch=epoch,
                 train_accuracy=train_accuracy,
@@ -156,6 +141,8 @@ class DataParallelFineTune:
 
 
 class Imagenette:
+    "Class to load the Imagenette dataset and create data loaders."
+
     def get_data_loaders(
         self,
         batch_size: int = 32,
@@ -164,7 +151,18 @@ class Imagenette:
         valid_data_size: int | None = None,
         test_data_size: int | None = None,
     ):
+        "Load the data and create data loaders."
 
+        # Load the data.
+        train_dir = os.path.expanduser("~/imagenette2/train")
+        val_dir = os.path.expanduser("~/imagenette2/val")
+        if not os.path.exists(train_dir) or not os.path.exists(val_dir):
+            print("The data may not be downloaded. Download as follows:")
+            print("wget https://s3.amazonaws.com/fast-ai-imageclas/imagenette2.tgz")
+            print("tar -xvzf imagenette2.tgz")
+            raise FileNotFoundError(f"{train_dir} or {val_dir} does not exist")
+
+        # Define the transformations.
         train_transforms = transforms.Compose(
             [
                 transforms.RandomResizedCrop(
@@ -191,15 +189,7 @@ class Imagenette:
             ]
         )
 
-        train_dir = os.path.expanduser("~/imagenette2/train")
-        val_dir = os.path.expanduser("~/imagenette2/val")
-        # check if these directories exist
-        if not os.path.exists(train_dir) or not os.path.exists(val_dir):
-            print("The data may not be downloaded. Download as follows:")
-            print("wget https://s3.amazonaws.com/fast-ai-imageclas/imagenette2.tgz")
-            print("tar -xvzf imagenette2.tgz")
-            raise FileNotFoundError(f"{train_dir} or {val_dir} does not exist")
-
+        # Load the data.
         train_dataset = datasets.ImageFolder(train_dir, transform=train_transforms)
         val_test_dataset = datasets.ImageFolder(val_dir, transform=val_transforms)
 
@@ -215,6 +205,7 @@ class Imagenette:
         val_dataset = self._subsample(val_dataset, valid_data_size)
         test_dataset = self._subsample(test_dataset, test_data_size)
 
+        # Create the data loaders.
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
         )
@@ -235,6 +226,7 @@ class Imagenette:
 
 
 def set_random_seed(seed: int):
+    "Set the random seed for reproducibility."
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -262,7 +254,7 @@ def data_parallel_main(args: dict):
     mlflow.log_param("test_data_size", test_data_size)
     mlflow.log_param("valid_data_size", valid_data_size)
 
-    # Load the model.
+    # Load the model and wrap it in DataParallel if needed and multiple GPUs are available.
     model = models.resnet152(weights=models.ResNet152_Weights.DEFAULT)
     if do_data_parallel and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model, device_ids=cfg.visible_devices)
@@ -287,14 +279,13 @@ def data_parallel_main(args: dict):
     torch.cuda.set_per_process_memory_fraction(cfg.memory_limit)
     model.to(rank)  # Move the model to the specified device
     print("Training on " + str(rank))  # Print the device being used for training
-    start_time = datetime.now()  # Record the start time for training
+    start_time = datetime.now()
 
     train_acc, val_acc, epochs = trainer.train_model(
         train_loader=train_loader,
         val_loader=val_loader,
         rank=rank,
         max_n_epochs=max_n_epochs,
-        do_data_parallel=do_data_parallel,
     )
 
     end_time = datetime.now()
@@ -320,8 +311,6 @@ if __name__ == "__main__":
         "localhost"  # The IP address of the master node (can be localhost for a single machine)
     )
     os.environ["MASTER_PORT"] = "12355"  # Any open port number
-
-    dist.init_process_group(backend="nccl")
 
     batch_size = cfg.per_device_batch_size * total_devices
 
@@ -349,5 +338,3 @@ if __name__ == "__main__":
         data_parallel_main(args)
         max_memory_consumed = round(torch.cuda.max_memory_allocated() / 1e9, 2)
         mlflow.log_metric("max_memory_per_device_GB", max_memory_consumed)
-
-    dist.destroy_process_group()
