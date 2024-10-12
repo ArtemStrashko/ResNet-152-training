@@ -1,0 +1,15 @@
+name: Resnet on Imagenette
+
+python_env: requirements.yaml
+
+entry_points:
+
+  # Execution Command : mlflow run /home/ubuntu/model-training-coding-assignment/raytune_mlflow_project -e train
+  train:
+    command: "python3 tune.py"
+
+  # Execution Command : mlflow run /home/ubuntu/model-training-coding-assignment/raytune_mlflow_project -e reproduce -P reproduce_run_id=<run_id>
+  reproduce:
+    parameters:
+      reproduce_run_id: {type: str}
+    command: "python3 reproduce.py {reproduce_run_id}"

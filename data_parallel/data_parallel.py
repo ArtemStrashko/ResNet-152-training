@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 
 import config as cfg  # Import a custom configuration module (assumed to exist)
+import mlflow
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,8 +13,6 @@ from torch.utils.data import DataLoader, Subset, random_split
 from torchvision import datasets, models, transforms
 from tqdm import tqdm
 
-import mlflow
-
 
 class DataParallelFineTune:
     "Basic class to fine-tune a model using data parallelism."
@@ -21,9 +20,6 @@ class DataParallelFineTune:
     def __init__(
         self,
         model: nn.Module,
-        #  optimizer=None,
-        #  criterion=None,
-        #  scheduler=None,
         learning_rate: float = 1e-4,
         n_data_classes: int = 10,
     ):
@@ -237,6 +233,9 @@ def set_random_seed(seed: int):
 
 def data_parallel_main(args: dict):
 
+    mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
+    parent_run = args["mlflow_parent_run"]
+
     set_random_seed(1234)
     do_data_parallel = args["do_data_parallel"]
     batch_size = args["batch_size"]
@@ -246,21 +245,10 @@ def data_parallel_main(args: dict):
     test_data_size = args["test_data_size"]
     valid_data_size = args["valid_data_size"]
 
-    # Log parameters to mlflow.
-    mlflow.log_param("learning_rate", learning_rate)
-    mlflow.log_param("batch_size", batch_size)
-    mlflow.log_param("max_n_epochs", max_n_epochs)
-    mlflow.log_param("train_data_size", train_data_size)
-    mlflow.log_param("test_data_size", test_data_size)
-    mlflow.log_param("valid_data_size", valid_data_size)
-
     # Load the model and wrap it in DataParallel if needed and multiple GPUs are available.
     model = models.resnet152(weights=models.ResNet152_Weights.DEFAULT)
     if do_data_parallel and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model, device_ids=cfg.VISIBLE_DEVICES)
-
-    mlflow.log_param("do_data_parallel", do_data_parallel)
-    mlflow.log_param("n_GPUs", torch.cuda.device_count())
 
     # Load the data loaders.
     dataset = Imagenette()
@@ -281,43 +269,41 @@ def data_parallel_main(args: dict):
     print("Training on " + str(rank))  # Print the device being used for training
     start_time = datetime.now()
 
-    train_acc, val_acc, epochs = trainer.train_model(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        rank=rank,
-        max_n_epochs=max_n_epochs,
-    )
+    with mlflow.start_run(experiment_id=cfg.MLFLOW_EXPERIMENT_ID, nested=True):
+        if parent_run is not None:
+            mlflow.set_tag("mlflow.parentRunId", parent_run.info.run_id)
+        mlflow.log_param("learning_rate", learning_rate)
+        mlflow.log_param("batch_size", batch_size)
+        mlflow.log_param("max_n_epochs", max_n_epochs)
+        mlflow.log_param("train_data_size", train_data_size)
+        mlflow.log_param("test_data_size", test_data_size)
+        mlflow.log_param("valid_data_size", valid_data_size)
 
-    end_time = datetime.now()
+        train_acc, val_acc, epochs = trainer.train_model(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            rank=rank,
+            max_n_epochs=max_n_epochs,
+        )
 
-    test_acc = trainer.eval(test_loader, rank)
+        test_acc = trainer.eval(test_loader, rank)
+        end_time = datetime.now()
 
-    mlflow.log_metric("final_train_acc", train_acc)
-    mlflow.log_metric("final_val_acc", val_acc)
-    mlflow.log_metric("final_test_acc", test_acc)
-    mlflow.log_metric("time_per_epoch", ((end_time - start_time).seconds) / epochs)
+        mlflow.log_metric("final_train_acc", train_acc)
+        mlflow.log_metric("final_val_acc", val_acc)
+        mlflow.log_metric("final_test_acc", test_acc)
+        mlflow.log_metric("time_per_epoch", ((end_time - start_time).seconds) / epochs)
+
+    return {"clf_accuracy": val_acc}
 
 
 if __name__ == "__main__":
 
     total_devices = len(cfg.VISIBLE_DEVICES) if cfg.DO_DATA_PARALLEL else 1
-    print(f"Training on {total_devices} devices")
-
-    os.environ["RANK"] = (
-        "0"  # Set this to 0 for the master process (or a unique rank for each process)
-    )
-    os.environ["WORLD_SIZE"] = "1"  # Set this to the total number of nodes.
-    os.environ["MASTER_ADDR"] = (
-        "localhost"  # The IP address of the master node (can be localhost for a single machine)
-    )
-    os.environ["MASTER_PORT"] = "12355"  # Any open port number
-
     batch_size = cfg.PER_DEVICE_BATCH_SIZE * total_devices
-
+    print(f"Training on {total_devices} devices")
     print("Per Device Batch Size = ", cfg.PER_DEVICE_BATCH_SIZE)
     print("Total Effective Batch Size = ", batch_size)
-
-    print("Training on", total_devices, "GPUs")
 
     args = {
         "do_data_parallel": cfg.DO_DATA_PARALLEL,
@@ -328,13 +314,9 @@ if __name__ == "__main__":
         "test_data_size": cfg.TEST_DATA_SIZE,
         "valid_data_size": cfg.VALID_DATA_SIZE,
         "device": cfg.DEVICE,
+        "mlflow_parent_run": cfg.MLFLOW_PARENT_RUN,
     }
 
-    mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(cfg.MLFLOW_EXPERIMENT_ID)
-    with mlflow.start_run(run_name=cfg.MLFLOW_RUN_NAME):
-        mlflow.log_params(args)
-
-        data_parallel_main(args)
-        max_memory_consumed = round(torch.cuda.max_memory_allocated() / 1e9, 2)
-        mlflow.log_metric("max_memory_per_device_GB", max_memory_consumed)
+    data_parallel_main(args)
+    max_memory_consumed = round(torch.cuda.max_memory_allocated() / 1e9, 2)
+    print(f"Max memory consumed: {max_memory_consumed} GB")
