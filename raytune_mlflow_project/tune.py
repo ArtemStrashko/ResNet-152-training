@@ -1,5 +1,12 @@
 """
-Execute using 'python3 /raytune_mlflow_project/tune.py'
+Hyperparameter Tuning Script with Ray Tune and MLflow
+
+This script performs hyperparameter tuning for a model training function using Ray Tune, Optuna for Bayesian
+optimization, and MLflow for experiment tracking. It uses data parallelism and distributed resources
+for efficient tuning across multiple GPUs.
+
+Usage:
+    Execute using: `python3 /path/to/raytune_mlflow_project/tune.py`
 """
 
 import config as cfg
@@ -13,7 +20,7 @@ from data_parallel.data_parallel import data_parallel_main
 # Set tracking URI and start parent run for MLflow logging
 mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
 with mlflow.start_run(experiment_id=cfg.MLFLOW_EXPERIMENT_ID) as parent_run:
-    parent_run_id = parent_run.info.run_id  # Obtain parent run ID for child runs
+    parent_run_id = parent_run.info.run_id  # Get parent run ID to link child runs
 
 config_space = {
     "do_data_parallel": cfg.DO_DATA_PARALLEL,
@@ -21,21 +28,23 @@ config_space = {
     "learning_rate": tune.loguniform(1e-5, 1e-2),
     "epochs": cfg.MAX_N_EPOCHS,
     "device": cfg.DEVICE,
-    "mlflow_parent_run_id": parent_run_id,  # Pass run ID as string
+    "mlflow_parent_run_id": parent_run_id,  # Pass parent run ID to link child runs in MLflow
 }
 
+# Define ASHA Scheduler for early stopping of poor trials based on intermediate results.
 scheduler = ASHAScheduler(metric="clf_accuracy", mode="max")
 
-# Use OptunaSearch for Bayesian optimization
+# Configure Optuna for Bayesian optimization to improve accuracy metric
 optuna_search = OptunaSearch(
     metric="clf_accuracy",
     mode="max",
 )
 
-# Assign resources for training function
+# Assign resources to the training function (e.g., specify GPU count)
 trainable_with_resources = tune.with_resources(data_parallel_main, {"gpu": cfg.NUM_GPU})
 
-# Tuner configuration
+# Set up the Ray Tune Tuner with defined hyperparameter space,
+# scheduler, and search algorithm
 tuner = tune.Tuner(
     trainable=trainable_with_resources,
     param_space=config_space,
@@ -46,11 +55,11 @@ tuner = tune.Tuner(
     ),
 )
 
-# Execute tuning and retrieve best result
+# Execute the tuning and retrieve the best trial result
 results = tuner.fit()
 best_trial = results.get_best_result("clf_accuracy", "max", "last")
 
-# Retrieve best hyperparameters
+# Display the best trial's hyperparameters and accuracy
 best_trial_config = best_trial.config
 print(
     "Best trial config {batch_size, learning_rate, epochs}: ",
