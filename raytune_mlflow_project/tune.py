@@ -1,7 +1,5 @@
 """
-
 Execute using 'python3 /raytune_mlflow_project/tune.py'
-
 """
 
 import config as cfg
@@ -12,15 +10,10 @@ from ray.tune.search.optuna import OptunaSearch
 
 from data_parallel.data_parallel import data_parallel_main
 
-# Starts a parent run to group all the tuning runs together
-# When run using MLflow Projects, this will return the run object
-# created my the CLI 'mlflow run ....'
+# Set tracking URI and start parent run for MLflow logging
 mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
-parent_run = mlflow.start_run(experiment_id=cfg.MLFLOW_EXPERIMENT_ID)
-
-# Important to finish the parent run, otherwise a bug in Mlflow Projects
-# logs everything to parent run instead of child runs
-mlflow.end_run(status="FINISHED")
+with mlflow.start_run(experiment_id=cfg.MLFLOW_EXPERIMENT_ID) as parent_run:
+    parent_run_id = parent_run.info.run_id  # Obtain parent run ID for child runs
 
 config_space = {
     "do_data_parallel": cfg.DO_DATA_PARALLEL,
@@ -28,7 +21,7 @@ config_space = {
     "learning_rate": tune.loguniform(1e-5, 1e-2),
     "epochs": cfg.MAX_N_EPOCHS,
     "device": cfg.DEVICE,
-    "mlflow_parent_run": parent_run,
+    "mlflow_parent_run_id": parent_run_id,  # Pass run ID as string
 }
 
 scheduler = ASHAScheduler(metric="clf_accuracy", mode="max")
@@ -39,8 +32,10 @@ optuna_search = OptunaSearch(
     mode="max",
 )
 
+# Assign resources for training function
 trainable_with_resources = tune.with_resources(data_parallel_main, {"gpu": cfg.NUM_GPU})
 
+# Tuner configuration
 tuner = tune.Tuner(
     trainable=trainable_with_resources,
     param_space=config_space,
@@ -51,10 +46,11 @@ tuner = tune.Tuner(
     ),
 )
 
+# Execute tuning and retrieve best result
 results = tuner.fit()
-
 best_trial = results.get_best_result("clf_accuracy", "max", "last")
 
+# Retrieve best hyperparameters
 best_trial_config = best_trial.config
 print(
     "Best trial config {batch_size, learning_rate, epochs}: ",
@@ -64,5 +60,4 @@ print(
         best_trial_config["epochs"],
     ],
 )
-
 print("Best trial final clf_accuracy:", best_trial.metrics["clf_accuracy"])

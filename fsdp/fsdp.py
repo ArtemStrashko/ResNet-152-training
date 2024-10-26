@@ -5,6 +5,7 @@ import time
 from datetime import datetime
 
 import config as cfg  # Import a custom configuration module (assumed to exist)
+import mlflow
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -18,8 +19,6 @@ from torch.utils.data import DataLoader, Subset, random_split
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, models, transforms
 from tqdm import tqdm
-
-import mlflow
 
 
 class FsdpFineTune:

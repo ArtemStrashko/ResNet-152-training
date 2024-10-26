@@ -1,6 +1,6 @@
 name: ResNet-152 Training
 
-python_env: dependencies.txt
+python_env: requirements.txt
 
 entry_points:
   train:
