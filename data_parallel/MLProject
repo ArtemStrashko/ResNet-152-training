@@ -1,7 +1,8 @@
 name: ResNet-152 Training
 
-python_env: requirements.txt
+# Specify the dependencies in a requirements file
+python_env: ../requirements.txt
 
 entry_points:
   train:
-    command: "python /ResNet-152-training/data_parallel"
+    command: "python ResNet-152-training/data_parallel_train.py"

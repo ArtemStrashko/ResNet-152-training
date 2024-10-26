@@ -5,7 +5,9 @@ This script demonstrates data parallel training of a deep learning
 resnet152 model on the Imagenette dataset using PyTorch, with logging
 via MLflow. It includes basic early stopping, model evaluation,
 and results logging.
-Execute with: `python data_parallel_train.py`
+
+To run the training with MLflow logging, use:
+    mlflow run <path_to_project_directory> -e train
 """
 
 import os

@@ -15,7 +15,7 @@ from ray import tune
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.search.optuna import OptunaSearch
 
-from data_parallel.data_parallel import data_parallel_main
+from data_parallel.data_parallel_train import data_parallel_main
 
 # Set tracking URI and start parent run for MLflow logging
 mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)

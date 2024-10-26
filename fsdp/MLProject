@@ -1,6 +1,7 @@
 name: ResNet-152 FSDP Training
 
-python_env: dependencies.txt
+# Specify the dependencies in a requirements file
+python_env: ../requirements.txt
 
 entry_points:
   train:

@@ -18,7 +18,7 @@ import sys
 import config as cfg
 import mlflow
 
-from data_parallel.data_parallel import data_parallel_main
+from data_parallel.data_parallel_train import data_parallel_main
 
 
 def reproduce_run(run_id):
