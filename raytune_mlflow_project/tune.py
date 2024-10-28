@@ -25,10 +25,15 @@ config_space = {
     "do_data_parallel": cfg.DO_DATA_PARALLEL,
     "batch_size": tune.choice(list(range(16, 34, 2))),
     "learning_rate": tune.loguniform(1e-5, 1e-2),
-    "epochs": cfg.MAX_N_EPOCHS,
+    "max_n_epochs": cfg.MAX_N_EPOCHS,
+    "train_data_size": cfg.TRAIN_DATA_SIZE,
+    "test_data_size": cfg.TEST_DATA_SIZE,
+    "valid_data_size": cfg.VALID_DATA_SIZE,
     "device": cfg.DEVICE,
-    "mlflow_parent_run_id": parent_run_id,  # Pass parent run ID to link child runs in MLflow
+    "mlflow_parent_run_id": parent_run_id
+    or None,  # Pass parent run ID to link child runs in MLflow
 }
+
 
 # Define ASHA Scheduler for early stopping of poor trials based on intermediate results.
 scheduler = ASHAScheduler(metric="clf_accuracy", mode="max")
@@ -65,7 +70,7 @@ print(
     [
         best_trial_config["batch_size"],
         best_trial_config["learning_rate"],
-        best_trial_config["epochs"],
+        best_trial_config["max_n_epochs"],
     ],
 )
 print("Best trial final clf_accuracy:", best_trial.metrics["clf_accuracy"])
