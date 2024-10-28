@@ -16,7 +16,7 @@ MEMORY_LIMIT = 1.0
 # Only use the specified devices
 VISIBLE_DEVICES = [0, 1, 2, 3]
 
-MLFLOW_TRACKING_URI = "http://localhost:5000"
+MLFLOW_TRACKING_URI = "http://localhost:5001"
 MLFLOW_EXPERIMENT_ID = "resnet152"
 MLFLOW_RUN_NAME = "data_parallel"
 MLFLOW_PARENT_RUN = None

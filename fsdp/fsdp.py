@@ -132,6 +132,13 @@ class FsdpFineTune:
                     val_acc=val_acc,
                     time_taken=time_taken,
                 )
+            self._log_metrics(
+                epoch=epoch,
+                train_accuracy=train_accuracy,
+                val_accuracy=val_accuracy,
+                time_taken=time_taken,
+                rank=rank,
+            )
 
                 # Early stopping
                 if val_acc > best_val_acc * 1.01:
@@ -161,18 +168,17 @@ class FsdpFineTune:
             return None, None, n_epochs
 
     def _log_metrics(
-        self, epoch: int, train_acc: float, val_acc: float, time_taken: float
+        self,
+        epoch: int,
+        train_accuracy: float,
+        val_accuracy: float,
+        time_taken: float,
+        rank: torch.device,
     ):
-        """Log metrics to MLflow on the master process."""
-        if dist.get_rank() == 0:
-            mlflow.log_metrics(
-                {
-                    "train_accuracy": train_acc,
-                    "val_accuracy": val_acc,
-                    "time_taken": time_taken,
-                },
-                step=epoch,
-            )
+        if rank == 0:
+            mlflow.log_metric("train_accuracy", train_accuracy, step=epoch)
+            mlflow.log_metric("val_accuracy", val_accuracy, step=epoch)
+            mlflow.log_metric("time_taken", time_taken, step=epoch)
 
 
 class ImagenetteDataLoader:
@@ -309,7 +315,7 @@ def cleanup_distributed():
     dist.destroy_process_group()
 
 
-def fsdp_main():
+def fsdp_main(args_dict):
     "Main function for training a model using FSDP."
 
     set_random_seed()
@@ -319,29 +325,27 @@ def fsdp_main():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    batch_size = cfg.PER_DEVICE_BATCH_SIZE
-    max_n_epochs = cfg.MAX_N_EPOCHS
-    learning_rate = cfg.LEARNING_RATE
-    train_data_size = cfg.TRAIN_DATA_SIZE
-    test_data_size = cfg.TEST_DATA_SIZE
-    valid_data_size = cfg.VALID_DATA_SIZE
+    if local_rank == 0:
+        mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
+        mlflow.set_experiment(cfg.MLFLOW_EXPERIMENT_ID)
+        mlflow_start = mlflow.start_run(run_name=cfg.MLFLOW_RUN_NAME)
+        mlflow.log_params(args)
+
+    batch_size = args_dict["per_device_batch_size"]
+    max_n_epochs = args_dict["max_n_epochs"]
+    learning_rate = args_dict["learning_rate"]
+    train_data_size = args_dict["train_data_size"]
+    test_data_size = args_dict["test_data_size"]
+    valid_data_size = args_dict["valid_data_size"]
 
     # Log parameters to mlflow.
     if rank == 0:
-        mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
-        mlflow.set_experiment(cfg.MLFLOW_EXPERIMENT_ID)
-        mlflow.start_run(run_name=cfg.MLFLOW_RUN_NAME)
-        mlflow.log_params(
-            {
-                "learning_rate": learning_rate,
-                "batch_size": batch_size,
-                "max_n_epochs": max_n_epochs,
-                "train_data_size": cfg.TRAIN_DATA_SIZE,
-                "test_data_size": cfg.TEST_DATA_SIZE,
-                "valid_data_size": cfg.VALID_DATA_SIZE,
-                "n_GPUs": torch.cuda.device_count(),
-            }
-        )
+        mlflow.log_param("learning_rate", learning_rate)
+        mlflow.log_param("batch_size", batch_size)
+        mlflow.log_param("max_n_epochs", max_n_epochs)
+        mlflow.log_param("train_data_size", train_data_size)
+        mlflow.log_param("test_data_size", test_data_size)
+        mlflow.log_param("valid_data_size", valid_data_size)
 
     dataset = ImagenetteDataLoader()
     train_loader, val_loader, test_loader = dataset.get_data_loaders(
@@ -372,17 +376,8 @@ def fsdp_main():
         cpu_offload=CPUOffload(offload_params=True),
     )
 
-    # Comments.
-    # 1. The auto_wrap_policy ensures that layers with more than 100 parameters
-    # are automatically sharded by FSDP. This policy is useful for large models
-    # like ResNet-152, which contain many layers, allowing the framework to handle
-    # only the larger layers that will benefit most from sharding.
-    # 2. ShardingStrategy.FULL_SHARD means that FSDP will fully shard the model's parameters,
-    # gradients, and optimizer states across all devices (GPUs). This maximizes memory savings.
-    # 3. With cpu_offload=CPUOffload(offload_params=True), model parameters are moved to the CPU
-    # when not in use, freeing up GPU memory for active computations. This can be beneficial in
-    # environments with limited GPU memory. However, it can slow down training due to the extra
-    # data transfer between CPU and GPU.
+    if rank == 0:
+        mlflow.log_param("n_GPUs", torch.cuda.device_count())
 
     # Initialize the trainer.
     trainer = FsdpFineTune(model=model, learning_rate=learning_rate)
@@ -401,19 +396,16 @@ def fsdp_main():
 
     test_acc = trainer.eval(test_loader, rank)
 
+    print(f"rank = {rank}")
     if rank == 0:
-        mlflow.log_metrics(
-            {
-                "final_train_acc": train_acc,
-                "final_val_acc": val_acc,
-                "final_test_acc": test_acc,
-                "time_per_epoch": ((end_time - start_time).seconds) / epochs,
-                "max_memory_per_device_GB": round(
-                    torch.cuda.max_memory_allocated() / 1e9, 2
-                ),
-            }
-        )
-        mlflow.end_run()
+        mlflow.log_metric("final_train_acc", train_acc)
+        mlflow.log_metric("final_val_acc", val_acc)
+        mlflow.log_metric("final_test_acc", test_acc)
+        mlflow.log_metric("time_per_epoch", ((end_time - start_time).seconds) / epochs)
+
+    max_memory_consumed = round(torch.cuda.max_memory_allocated() / 1e9, 2)
+    if local_rank == 0:
+        mlflow.log_metric("max_memory_per_device_GB", max_memory_consumed)
 
     dist.barrier()  # Synchronize all distributed processes
     cleanup_distributed()
@@ -433,13 +425,13 @@ if __name__ == "__main__":
     #     print("Per Device Batch Size = ", cfg.PER_DEVICE_BATCH_SIZE)
     #     print("Total Effective Batch Size = ", batch_size)
 
-    # args = {
-    #     "per_device_batch_size": cfg.PER_DEVICE_BATCH_SIZE,
-    #     "learning_rate": cfg.LEARNING_RATE,
-    #     "max_n_epochs": cfg.MAX_N_EPOCHS,
-    #     "train_data_size": cfg.TRAIN_DATA_SIZE,
-    #     "test_data_size": cfg.TEST_DATA_SIZE,
-    #     "valid_data_size": cfg.VALID_DATA_SIZE,
-    # }
+    args = {
+        "per_device_batch_size": cfg.PER_DEVICE_BATCH_SIZE,
+        "learning_rate": cfg.LEARNING_RATE,
+        "max_n_epochs": cfg.MAX_N_EPOCHS,
+        "train_data_size": cfg.TRAIN_DATA_SIZE,
+        "test_data_size": cfg.TEST_DATA_SIZE,
+        "valid_data_size": cfg.VALID_DATA_SIZE,
+    }
 
-    fsdp_main()
+    fsdp_main(args)
