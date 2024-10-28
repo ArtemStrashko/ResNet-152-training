@@ -1,0 +1,5 @@
+Run MFlow Tracking using the following command in a separate terminal. As soon as you start MLflow, VSCode will create a port forwarding tunnel, so you can access the remote MLflow server on your local machine.
+
+```
+mlflow ui --backend-store-uri sqlite:////home/ubuntu/mlruns.db --host 0.0.0.0 --port 5001
+```

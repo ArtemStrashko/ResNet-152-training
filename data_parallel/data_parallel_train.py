@@ -45,13 +45,15 @@ class DataParallelFineTune:
         """
         if isinstance(model, nn.DataParallel):
             n_input_features = model.module.fc.in_features
-            model_params = model.module.fc.parameters()
+            # Change the final layer to have the correct number of output features.
+            model.module.fc = torch.nn.Linear(n_input_features, n_data_classes)
+            model_params = model.module.fc.parameters()  # Capture new parameters here
         else:
             n_input_features = model.fc.in_features
-            model_params = model.fc.parameters()
+            # Change the final layer to have the correct number of output features.
+            model.fc = torch.nn.Linear(n_input_features, n_data_classes)
+            model_params = model.fc.parameters()  # Capture new parameters here
 
-        # Change the final layer to have the correct number of output features.
-        model.fc = torch.nn.Linear(n_input_features, n_data_classes)
         optimizer = optim.Adam(model_params, lr=learning_rate)
 
         self.model = model
@@ -340,9 +342,24 @@ def data_parallel_main(args: dict):
     print("Training on " + str(device))  # Print the device being used for training
     start_time = datetime.now()
 
-    with mlflow.start_run(experiment_id=cfg.MLFLOW_EXPERIMENT_ID, nested=True):
-        if parent_run is not None:
-            mlflow.set_tag("mlflow.parentRunId", parent_run.info.run_id)
+    # with mlflow.start_run(experiment_id=cfg.MLFLOW_EXPERIMENT_ID, nested=True):
+    #     if parent_run is not None:
+    #         mlflow.set_tag("mlflow.parentRunId", parent_run.info.run_id)
+    #     mlflow.log_params(args)
+
+    #     def start_run(
+    #     run_id: Optional[str] = None,
+    #     experiment_id: Optional[str] = None,
+    #     run_name: Optional[str] = None,
+    #     nested: bool = False,
+    #     parent_run_id: Optional[str] = None,
+    #     tags: Optional[Dict[str, Any]] = None,
+    #     description: Optional[str] = None,
+    #     log_system_metrics: Optional[bool] = None,
+    # )
+
+    mlflow.set_experiment(experiment_name=cfg.MLFLOW_EXPERIMENT_NAME)
+    with mlflow.start_run(run_name=cfg.MLFLOW_RUN_NAME):
         mlflow.log_params(args)
 
         train_acc, val_acc, epochs = trainer.train_model(
